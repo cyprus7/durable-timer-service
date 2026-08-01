@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: timer
+      POSTGRES_PASSWORD: timer
+      POSTGRES_DB: timer_service
+    ports:
+      - "${TIMER_E2E_PG_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U timer -d timer_service"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
