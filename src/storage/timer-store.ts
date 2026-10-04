@@ -11,11 +11,15 @@ import type {
 } from '../domain/types.js'
 
 export interface ScheduleStoreOptions {
+  readonly maxTimerStorageBytes?: number
+  readonly maxSchedulesPerMinute?: number
+  readonly maxTimersPerSession?: number
   readonly now: Date
   readonly receiptRetentionMs: number
 }
 
 export interface CancelStoreOptions {
+  readonly maxCancelSessionTimers?: number
   readonly now: Date
   readonly receiptRetentionMs: number
 }

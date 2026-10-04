@@ -30,6 +30,9 @@ export class TimerApplicationService {
     }
 
     const result = await this.store.scheduleTimer(command, {
+      maxTimerStorageBytes: this.config.maxTimerStorageBytes ?? 10 * 1024 ** 3,
+      maxSchedulesPerMinute: this.config.maxSchedulesPerMinute ?? 60_000,
+      maxTimersPerSession: this.config.maxTimersPerSession ?? 100_000,
       now: new Date(),
       receiptRetentionMs: this.config.receiptRetentionMs,
     })
@@ -48,6 +51,7 @@ export class TimerApplicationService {
 
   async cancelSession(raw: unknown): Promise<CancelSessionResult> {
     const result = await this.store.cancelSession(parseCancelSessionRequest(raw), {
+      maxCancelSessionTimers: this.config.maxCancelSessionTimers ?? 100_000,
       now: new Date(),
       receiptRetentionMs: this.config.receiptRetentionMs,
     })
