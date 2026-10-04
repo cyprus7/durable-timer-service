@@ -282,6 +282,27 @@ test('idle database disconnect is logged and a fresh connection recovers', async
   } finally { await Promise.all([store.close(), admin.end()]) }
 })
 
+test('checked-out transaction disconnect is handled and a fresh connection recovers', async () => {
+  const events: unknown[] = []
+  const store = new PostgresTimerStore(databaseUrl, { error: (...args) => { events.push(args) } })
+  const admin = new Pool({ connectionString: databaseUrl })
+  const transactional = store as unknown as {
+    withTransaction<T>(callback: (client: pg.PoolClient) => Promise<T>): Promise<T>
+  }
+  const originalFailure = new Error('original transaction failure')
+  try {
+    await assert.rejects(transactional.withTransaction(async client => {
+      const pid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+      await admin.query('SELECT pg_terminate_backend($1)', [pid])
+      // The checked-out client emits an error while no query is active.
+      await waitFor(() => events.length > 0)
+      throw originalFailure
+    }), error => error === originalFailure)
+    await store.ping()
+    assert.match(JSON.stringify(events), /timer_postgres_connection_failed/)
+  } finally { await Promise.all([store.close(), admin.end()]) }
+})
+
 interface Harness {
   readonly baseUrl: string
   stop(): Promise<void>

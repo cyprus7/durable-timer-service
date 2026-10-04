@@ -60,6 +60,13 @@ export class PostgresTimerStore implements TimerStore {
 
   constructor(databaseUrl: string, logger: Pick<Logger, 'error'> = createLogger({ service: 'timer-service' })) {
     this.pool = new Pool({ connectionString: databaseUrl })
+    // Pool errors cover idle clients only. Checked-out transaction clients
+    // can also emit errors between queries when PostgreSQL disconnects.
+    this.pool.on('connect', (client) => {
+      client.on('error', (error) => {
+        logger.error('timer_postgres_connection_failed', { code: (error as Error & { code?: string }).code ?? 'CONNECTION_LOST' })
+      })
+    })
     this.pool.on('error', (error) => {
       logger.error('timer_postgres_idle_connection_failed', { code: (error as Error & { code?: string }).code ?? 'CONNECTION_LOST' })
     })
@@ -458,6 +465,7 @@ export class PostgresTimerStore implements TimerStore {
 
   private async withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
+    let discardClient = false
 
     try {
       await client.query('BEGIN')
@@ -465,7 +473,12 @@ export class PostgresTimerStore implements TimerStore {
       await client.query('COMMIT')
       return result
     } catch (error) {
-      await client.query('ROLLBACK')
+      try {
+        await client.query('ROLLBACK')
+      } catch {
+        // Preserve the original failure and retire a disconnected connection.
+        discardClient = true
+      }
 
       if (isPgUniqueViolation(error)) {
         throw new ServiceError(409, 'timer_id_conflict', 'timerId already exists in another active or finished timer')
@@ -473,7 +486,7 @@ export class PostgresTimerStore implements TimerStore {
 
       throw error
     } finally {
-      client.release()
+      client.release(discardClient)
     }
   }
 }
