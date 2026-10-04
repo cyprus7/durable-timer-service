@@ -13,20 +13,29 @@ async function main(): Promise<void> {
   const config = readConfig()
   const logger = createLogger({ service: 'timer-service', instanceId: config.instanceId })
   const metrics = new TimerMetrics({ instanceId: config.instanceId })
-  const store = new PostgresTimerStore(config.databaseUrl)
+  const store = new PostgresTimerStore(config.databaseUrl, logger)
   const registry = new StaticCallbackRegistry(config.targets)
   const service = new TimerApplicationService(store, registry, config, metrics)
   const callbackClient = new HttpCallbackClient(
     registry,
     config.httpClientTimeoutMs,
     config.maxCallbackResponseBytes,
+    config.callbackSecret,
   )
   const worker = config.workerEnabled ? new TimerWorker(store, callbackClient, config, logger, metrics) : null
   const server = createApiServer({ config, service, store, logger, metrics })
 
   if (config.autoMigrate) {
     await store.runMigrationFile(join(process.cwd(), 'migrations', '001_init.sql'))
+    await store.runMigrationFile(join(process.cwd(), 'migrations', '002_admission.sql'))
     logger.info('timer_service_migrations_applied')
+  }
+
+  if (config.apiToken && !config.tlsCertFile && !config.allowInsecureHttp) {
+    throw new Error('Configure TLS_CERT_FILE/TLS_KEY_FILE or explicitly set ALLOW_INSECURE_HTTP=true behind a trusted TLS proxy')
+  }
+  if (config.allowInsecureHttp || !config.apiToken) {
+    logger.warn('timer_service_insecure_transport_or_auth_enabled')
   }
 
   server.listen(config.port, () => {

@@ -12,6 +12,7 @@ import type {
   ScheduleTimerCommand,
   ScheduleTimerResult,
 } from '../domain/types.js'
+import { createLogger, type Logger } from '../logger.js'
 import { ServiceError } from '../utils/errors.js'
 import { addMs } from '../utils/time.js'
 import type {
@@ -57,8 +58,18 @@ interface ReceiptRow {
 export class PostgresTimerStore implements TimerStore {
   private readonly pool: pg.Pool
 
-  constructor(databaseUrl: string) {
+  constructor(databaseUrl: string, logger: Pick<Logger, 'error'> = createLogger({ service: 'timer-service' })) {
     this.pool = new Pool({ connectionString: databaseUrl })
+    // Pool errors cover idle clients only. Checked-out transaction clients
+    // can also emit errors between queries when PostgreSQL disconnects.
+    this.pool.on('connect', (client) => {
+      client.on('error', (error) => {
+        logger.error('timer_postgres_connection_failed', { code: (error as Error & { code?: string }).code ?? 'CONNECTION_LOST' })
+      })
+    })
+    this.pool.on('error', (error) => {
+      logger.error('timer_postgres_idle_connection_failed', { code: (error as Error & { code?: string }).code ?? 'CONNECTION_LOST' })
+    })
   }
 
   async ping(): Promise<void> {
@@ -76,6 +87,8 @@ export class PostgresTimerStore implements TimerStore {
 
   async scheduleTimer(command: ScheduleTimerCommand, options: ScheduleStoreOptions): Promise<ScheduleTimerResult> {
     return this.withTransaction(async (client) => {
+      // Serialize only admission/cancel-session across replicas. Workers remain independent.
+      await client.query('SELECT id FROM timer_admission WHERE id = 1 FOR UPDATE')
       const receipt = await findReceipt(client, command.timerId)
 
       if (receipt) {
@@ -92,6 +105,7 @@ export class PostgresTimerStore implements TimerStore {
       const current = await findSlot(client, command.namespace, command.timerKey)
 
       if (!current) {
+        await admitSchedule(client, command, options, true)
         await insertSlot(client, command, options.now)
 
         return {
@@ -130,6 +144,7 @@ export class PostgresTimerStore implements TimerStore {
         }
       }
 
+      await admitSchedule(client, command, options, current.session_id !== command.sessionId)
       await insertReceipt(client, {
         timerId: current.timer_id,
         namespace: current.namespace,
@@ -229,26 +244,28 @@ export class PostgresTimerStore implements TimerStore {
 
   async cancelSession(command: CancelSessionCommand, options: CancelStoreOptions): Promise<CancelSessionResult> {
     return this.withTransaction(async (client) => {
-      const deleted = await client.query<SlotRow>(
-        `
-          DELETE FROM timer_slots
-          WHERE namespace = $1 AND session_id = $2
-          RETURNING *
-        `,
-        [command.namespace, command.sessionId],
+      await client.query('SELECT id FROM timer_admission WHERE id = 1 FOR UPDATE')
+      const limit = options.maxCancelSessionTimers ?? 100_000
+      const count = await client.query<{ count: number }>(
+        'SELECT count(*)::int AS count FROM (SELECT 1 FROM timer_slots WHERE namespace = $1 AND session_id = $2 LIMIT $3) AS bounded',
+        [command.namespace, command.sessionId, limit + 1],
       )
-
-      for (const row of deleted.rows) {
-        await insertReceipt(client, {
-          timerId: row.timer_id,
-          namespace: row.namespace,
-          timerKey: row.timer_key,
-          generation: Number(row.generation),
-          disposition: 'cancelled',
-          now: options.now,
-          retentionMs: options.receiptRetentionMs,
-        })
+      if (count.rows[0]!.count > limit) {
+        throw new ServiceError(413, 'session_too_large', 'Session exceeds MAX_CANCEL_SESSION_TIMERS; cancel individual timers or raise the limit')
       }
+      // No payloads enter Node memory. Preserve atomic cancellation and the existing
+      // response contract; never silently return a partially cancelled session.
+      const deleted = await client.query<{ timer_id: string }>(
+        `WITH deleted AS (
+          DELETE FROM timer_slots WHERE namespace = $1 AND session_id = $2
+          RETURNING timer_id, namespace, timer_key, generation
+        ), receipts AS (
+          INSERT INTO timer_receipts (timer_id, namespace, timer_key, generation, disposition, finished_at, expires_at)
+          SELECT timer_id, namespace, timer_key, generation, 'cancelled', $3::timestamptz, $4::timestamptz FROM deleted
+          ON CONFLICT (timer_id) DO NOTHING
+        ) SELECT timer_id FROM deleted`,
+        [command.namespace, command.sessionId, options.now, addMs(options.now, options.receiptRetentionMs)],
+      )
 
       return {
         namespace: command.namespace,
@@ -448,6 +465,7 @@ export class PostgresTimerStore implements TimerStore {
 
   private async withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
+    let discardClient = false
 
     try {
       await client.query('BEGIN')
@@ -455,7 +473,12 @@ export class PostgresTimerStore implements TimerStore {
       await client.query('COMMIT')
       return result
     } catch (error) {
-      await client.query('ROLLBACK')
+      try {
+        await client.query('ROLLBACK')
+      } catch {
+        // Preserve the original failure and retire a disconnected connection.
+        discardClient = true
+      }
 
       if (isPgUniqueViolation(error)) {
         throw new ServiceError(409, 'timer_id_conflict', 'timerId already exists in another active or finished timer')
@@ -463,7 +486,7 @@ export class PostgresTimerStore implements TimerStore {
 
       throw error
     } finally {
-      client.release()
+      client.release(discardClient)
     }
   }
 }
@@ -691,4 +714,32 @@ function toClaimedTimer(row: SlotRow): ClaimedTimer {
 
 function isPgUniqueViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === '23505'
+}
+
+async function admitSchedule(client: PoolClient, command: ScheduleTimerCommand, options: ScheduleStoreOptions, addsToSession: boolean): Promise<void> {
+  const storage = await client.query<{ bytes: string }>(
+    "SELECT (pg_total_relation_size('timer_slots') + pg_total_relation_size('timer_receipts') + pg_total_relation_size('timer_dead_letters'))::text AS bytes",
+  )
+  if (Number(storage.rows[0]!.bytes) >= (options.maxTimerStorageBytes ?? 10 * 1024 ** 3)) {
+    throw new ServiceError(429, 'storage_capacity', 'Timer storage admission threshold reached')
+  }
+  if (addsToSession) {
+    const limit = options.maxTimersPerSession ?? 100_000
+    const count = await client.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM (SELECT 1 FROM timer_slots WHERE namespace = $1 AND session_id = $2 LIMIT $3) AS bounded',
+      [command.namespace, command.sessionId, limit],
+    )
+    if (count.rows[0]!.count >= limit) throw new ServiceError(429, 'session_capacity', 'Session timer capacity reached')
+  }
+  // DB time avoids skew between replicas. The locked singleton cannot grow with
+  // attacker-controlled namespace/session values. Failed transactions consume no quota.
+  const rate = await client.query(
+    `UPDATE timer_admission SET
+      scheduled = CASE WHEN window_start <= clock_timestamp() - interval '1 minute' THEN 1 ELSE scheduled + 1 END,
+      window_start = CASE WHEN window_start <= clock_timestamp() - interval '1 minute' THEN clock_timestamp() ELSE window_start END
+    WHERE id = 1 AND (window_start <= clock_timestamp() - interval '1 minute' OR scheduled < $1)
+    RETURNING id`,
+    [options.maxSchedulesPerMinute ?? 60_000],
+  )
+  if (!rate.rowCount) throw new ServiceError(429, 'schedule_rate', 'Scheduling rate limit reached')
 }

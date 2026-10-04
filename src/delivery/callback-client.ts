@@ -22,6 +22,7 @@ export class HttpCallbackClient {
     private readonly registry: CallbackRegistry,
     private readonly timeoutMs: number,
     private readonly maxResponseBytes = 64 * 1024,
+    private readonly callbackSecret?: string,
   ) {}
 
   async deliver(timer: ClaimedTimer): Promise<CallbackDeliveryResult> {
@@ -37,8 +38,10 @@ export class HttpCallbackClient {
     try {
       const response = await fetch(url, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           'content-type': 'application/json',
+          ...(this.callbackSecret ? { 'x-timer-callback-secret': this.callbackSecret } : {}),
           'x-timer-id': timer.timerId,
           'x-timer-key': timer.timerKey,
           'x-timer-generation': String(timer.generation),

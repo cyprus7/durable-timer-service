@@ -31,3 +31,13 @@ jobs:
 
       - name: Build and test
         run: npm test
+
+      - name: Start integration database
+        run: npm run e2e:up
+
+      - name: Test PostgreSQL admission and HTTP security
+        run: npm run test:e2e
+
+      - name: Stop integration database
+        if: always()
+        run: npm run e2e:down

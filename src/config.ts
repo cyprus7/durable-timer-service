@@ -6,6 +6,15 @@ export interface AppConfig {
   readonly databaseUrl: string
   readonly autoMigrate: boolean
   readonly apiToken: string | null
+  readonly callbackSecret?: string
+  readonly tlsCertFile?: string
+  readonly tlsKeyFile?: string
+  readonly allowInsecureHttp?: boolean
+  readonly maxTimerStorageBytes?: number
+  readonly maxSchedulesPerMinute?: number
+  readonly maxTimersPerSession?: number
+  readonly maxCancelSessionTimers?: number
+  readonly maxConcurrentRequests?: number
   readonly workerEnabled: boolean
   readonly instanceId: string
   readonly targets: ReadonlyMap<string, string>
@@ -36,11 +45,24 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('API_TOKEN is required unless ALLOW_INSECURE_NO_AUTH=true')
   }
 
+  if (!!readOptionalString(env.TLS_CERT_FILE) !== !!readOptionalString(env.TLS_KEY_FILE)) {
+    throw new Error('TLS_CERT_FILE and TLS_KEY_FILE must be configured together')
+  }
+
   return {
     port: readInteger(env.PORT, 8080),
     databaseUrl,
     autoMigrate: readBoolean(env.AUTO_MIGRATE, false),
     apiToken,
+    ...(readOptionalString(env.TIMER_CALLBACK_SECRET) ? { callbackSecret: env.TIMER_CALLBACK_SECRET!.trim() } : {}),
+    ...(readOptionalString(env.TLS_CERT_FILE) ? { tlsCertFile: env.TLS_CERT_FILE!.trim() } : {}),
+    ...(readOptionalString(env.TLS_KEY_FILE) ? { tlsKeyFile: env.TLS_KEY_FILE!.trim() } : {}),
+    allowInsecureHttp: readBoolean(env.ALLOW_INSECURE_HTTP, false),
+    maxTimerStorageBytes: readInteger(env.MAX_TIMER_STORAGE_BYTES, 10 * 1024 ** 3),
+    maxSchedulesPerMinute: readInteger(env.MAX_SCHEDULES_PER_MINUTE, 60_000),
+    maxTimersPerSession: readInteger(env.MAX_TIMERS_PER_SESSION, 100_000),
+    maxCancelSessionTimers: readInteger(env.MAX_CANCEL_SESSION_TIMERS, 100_000),
+    maxConcurrentRequests: readInteger(env.MAX_CONCURRENT_REQUESTS, 256),
     workerEnabled: readBoolean(env.WORKER_ENABLED, true),
     instanceId: readOptionalString(env.INSTANCE_ID) ?? `${hostname()}:${process.pid}`,
     targets: parseTargets(env.TIMER_TARGETS),

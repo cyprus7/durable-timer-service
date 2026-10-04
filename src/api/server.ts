@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { createServer as createHttpsServer } from 'node:https'
+import { TLSSocket } from 'node:tls'
 import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AppConfig } from '../config.js'
@@ -16,9 +19,24 @@ export interface ApiServerDependencies {
 }
 
 export function createApiServer(deps: ApiServerDependencies): Server {
-  return createServer((request, response) => {
-    void handleRequest(request, response, deps)
-  })
+  let active = 0
+  const listener = (request: IncomingMessage, response: ServerResponse) => {
+    if (active >= (deps.config.maxConcurrentRequests ?? 256)) {
+      response.setHeader('connection', 'close')
+      response.setHeader('retry-after', '1')
+      sendJson(response, 503, { error: { code: 'busy', message: 'Too many concurrent requests' } })
+      return
+    }
+    active += 1
+    void handleRequest(request, response, deps).finally(() => { active -= 1 })
+  }
+  if (deps.config.tlsCertFile && deps.config.tlsKeyFile) {
+    return createHttpsServer({
+      cert: readFileSync(deps.config.tlsCertFile),
+      key: readFileSync(deps.config.tlsKeyFile),
+    }, listener)
+  }
+  return createServer(listener)
 }
 
 async function handleRequest(
@@ -81,6 +99,7 @@ async function handleRequest(
       deps.logger.error('request_failed', { error })
     }
 
+    if (statusCode === 429) response.setHeader('retry-after', '60')
     sendJson(response, statusCode, { error: { code, message, details } })
   }
 }
@@ -88,6 +107,12 @@ async function handleRequest(
 function authorize(request: IncomingMessage, config: AppConfig): void {
   if (!config.apiToken) {
     return
+  }
+
+  // Never trust forwarded-proto from an arbitrary peer. TLS terminators must
+  // explicitly enable compatibility mode and restrict access to this listener.
+  if (!config.allowInsecureHttp && !(request.socket instanceof TLSSocket && request.socket.encrypted)) {
+    throw new ServiceError(403, 'https_required', 'Bearer authentication requires HTTPS')
   }
 
   const authorization = request.headers.authorization

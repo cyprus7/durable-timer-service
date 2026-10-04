@@ -1,5 +1,9 @@
 # Durable Timer Service
 
+See [security settings and upgrade procedure](docs/security-and-upgrade.md)
+before upgrading an existing HTTP deployment. Capacity limits are configurable
+with generous defaults; TLS termination requires explicit configuration.
+
 A small TypeScript service for durable, one-shot timer delivery. PostgreSQL stores pending timers, and workers deliver due timers to a server-configured HTTP callback.
 
 ## Guarantees
