@@ -28,10 +28,29 @@ The service stores timer and delivery metadata only. The callback consumer remai
 npm ci
 cp .env.example .env
 npm run build
-npm start
 ```
 
-Apply `migrations/001_init.sql` before starting the service, or set `AUTO_MIGRATE=true` for a single-instance local environment.
+Edit `.env` for your database, callback target and authentication/transport
+settings. Export the same `DATABASE_URL` in your shell for the `psql` commands
+below; `psql` does not read `.env` automatically.
+
+For a new database, apply **both** migrations in order before starting the service:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_init.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_admission.sql
+```
+
+For an existing database that already has `001_init.sql`, apply only
+`002_admission.sql` before upgrading the binaries. Keep the migrations separate:
+replacing `001` with a combined file would not upgrade databases where `001` has
+already been applied. `AUTO_MIGRATE=true` applies both at startup for a
+single-instance local environment; use the explicit migration step for a
+multi-replica deployment. See the [upgrade order](docs/security-and-upgrade.md).
+
+```bash
+node --env-file=.env dist/src/main.js
+```
 
 `API_TOKEN` is required by default. Generate a long random value and send it as a bearer token to all `/v1/*` endpoints. `ALLOW_INSECURE_NO_AUTH=true` disables this requirement and should only be used for isolated local development.
 
@@ -46,7 +65,7 @@ Apply `migrations/001_init.sql` before starting the service, or set `AUTO_MIGRAT
 | `TIMER_TARGETS` | empty | JSON object or comma-separated `name=url` callback registry. |
 | `TIMER_LANES` | `realtime` | Comma-separated lanes processed by this instance. |
 | `WORKER_ENABLED` | `true` | Enable background delivery workers. |
-| `AUTO_MIGRATE` | `false` | Apply the bundled initial migration at startup. |
+| `AUTO_MIGRATE` | `false` | Apply both bundled migrations at startup; use only for single-instance local development. |
 | `CLAIM_BATCH_SIZE` | `25` | Maximum timers claimed per poll. |
 | `LEASE_MS` | `20000` | Claim lease duration. |
 | `POLL_INTERVAL_MS` | `250` | Worker polling interval. |
@@ -126,7 +145,7 @@ Cancellation must match both `timerId` and `generation`.
 
 - `GET /v1/targets` returns configured logical target names and requires authentication.
 - `GET /health/live` reports process liveness.
-- `GET /health/ready` checks database connectivity.
+- `GET /health/ready` checks database connectivity and the required tables and admission row. An incomplete schema returns 503 with code `schema_not_ready`; startup also fails before listening when a migration is missing.
 - `GET /metrics` exposes Prometheus text metrics.
 
 Protect health and metrics endpoints at the network perimeter when they are not intended to be public.

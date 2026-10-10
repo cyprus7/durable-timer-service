@@ -8,6 +8,7 @@ import { TimerApplicationService } from './domain/timer-service.js'
 import { createLogger } from './logger.js'
 import { TimerMetrics } from './metrics.js'
 import { PostgresTimerStore } from './storage/postgres-timer-store.js'
+import { toErrorMessage } from './utils/errors.js'
 
 async function main(): Promise<void> {
   const config = readConfig()
@@ -30,6 +31,10 @@ async function main(): Promise<void> {
     await store.runMigrationFile(join(process.cwd(), 'migrations', '002_admission.sql'))
     logger.info('timer_service_migrations_applied')
   }
+
+  // Fail before opening the API or starting workers if a deployment only ran
+  // 001 (or if the admission singleton was removed). Readiness rechecks this.
+  await store.ping()
 
   if (config.apiToken && !config.tlsCertFile && !config.allowInsecureHttp) {
     throw new Error('Configure TLS_CERT_FILE/TLS_KEY_FILE or explicitly set ALLOW_INSECURE_HTTP=true behind a trusted TLS proxy')
@@ -77,6 +82,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  console.error(JSON.stringify({ level: 'fatal', message: 'timer_service_start_failed', error }))
+  console.error(JSON.stringify({ level: 'fatal', message: 'timer_service_start_failed', error: toErrorMessage(error) }))
   process.exit(1)
 })

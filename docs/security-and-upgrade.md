@@ -8,15 +8,23 @@ are unchanged. There is no application-specific code or dependency.
 ## Deployment order
 
 1. Review capacity and set the environment values below on **all** replicas.
-2. Apply `migrations/002_admission.sql` after `001_init.sql` before starting the
-   new binaries (`AUTO_MIGRATE=true` applies both). The migration is additive and
+2. On a new database, apply `migrations/001_init.sql` and then
+   `migrations/002_admission.sql`. On an existing database with `001`, apply
+   `002` before starting the new binaries. Use `psql -v ON_ERROR_STOP=1 -f` so a
+   failed migration stops the rollout. `AUTO_MIGRATE=true` applies both only for
+   a single-instance local environment. The `002` migration is additive and
    idempotent; it does not rewrite or discard existing timers or receipts.
+   Keep `002` separate from `001` so existing databases receive it during an
+   upgrade.
 3. Configure native HTTPS with `TLS_CERT_FILE` and `TLS_KEY_FILE`. Existing
    deployments using HTTP behind a trusted TLS terminator must explicitly set
    `ALLOW_INSECURE_HTTP=true` before upgrading. Restrict listener access to that
    proxy. Forwarded headers alone never establish transport trust.
 4. Upgrade **all scheduler replicas together**: old binaries bypass admission.
-   Verify readiness, a real scheduled callback, cancellation and metrics.
+   Startup now checks the required tables and the `timer_admission` row before
+   opening the listener. Readiness rechecks them and returns 503 with code
+   `schema_not_ready` if the schema becomes incomplete. Verify readiness, a real
+   scheduled callback, cancellation and metrics.
 5. A binary rollback can leave the additive admission table in place, but it
    restores the old vulnerabilities. Never rotate callback credentials while
    outstanding callbacks still require the previous credential.

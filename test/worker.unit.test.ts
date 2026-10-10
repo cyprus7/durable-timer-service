@@ -4,6 +4,7 @@ import test from 'node:test'
 import type { AppConfig } from '../src/config.js'
 import type { HttpCallbackClient } from '../src/delivery/callback-client.js'
 import { TimerWorker } from '../src/delivery/worker.js'
+import type { ClaimedTimer } from '../src/domain/types.js'
 import type { Logger } from '../src/logger.js'
 import { TimerMetrics } from '../src/metrics.js'
 import type { TimerStore } from '../src/storage/timer-store.js'
@@ -90,4 +91,36 @@ test('idle polling does not accumulate abort listeners', async () => {
   }
 
   assert.equal(getEventListeners(signal, 'abort').length, 0)
+})
+
+test('a callback from a stale lease is not reported as a completed delivery', async () => {
+  const warnings: string[] = []
+  const infos: string[] = []
+  const logger: Logger = {
+    debug: () => {},
+    info: message => { infos.push(message) },
+    warn: message => { warnings.push(message) },
+    error: () => {},
+  }
+  const store = { completeTimer: async () => false } as unknown as TimerStore
+  const callbackClient = {
+    deliver: async () => ({ kind: 'terminal', disposition: 'applied' }),
+  } as unknown as HttpCallbackClient
+  const config = { instanceId: 'stale-lease-test', receiptRetentionMs: 60_000 } as AppConfig
+  const metrics = new TimerMetrics({ instanceId: config.instanceId })
+  const worker = new TimerWorker(store, callbackClient, config, logger, metrics)
+  const now = new Date()
+  const timer: ClaimedTimer = {
+    namespace: 'test', timerKey: 'stale', timerId: 'stale-id', generation: 1,
+    sessionId: 'session', kind: 'test', lane: 'realtime', dueAt: now,
+    deliverUntil: new Date(now.getTime() + 60_000), target: 'test', routingKey: null,
+    payload: {}, attempt: 0, leaseOwner: 'old-worker',
+    leaseUntil: new Date(now.getTime() + 1_000), scheduledAt: now, updatedAt: now,
+  }
+
+  await (worker as unknown as { deliver(timer: ClaimedTimer): Promise<void> }).deliver(timer)
+
+  assert.deepEqual(infos, [])
+  assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored'])
+  assert.doesNotMatch(metrics.render(), /timer_service_deliveries_total/)
 })

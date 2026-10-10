@@ -73,7 +73,46 @@ export class PostgresTimerStore implements TimerStore {
   }
 
   async ping(): Promise<void> {
-    await this.pool.query('SELECT 1')
+    const result = await this.pool.query<{
+      slots: string | null
+      receipts: string | null
+      deadLetters: string | null
+      admission: string | null
+    }>(`
+      SELECT
+        to_regclass('timer_slots')::text AS slots,
+        to_regclass('timer_receipts')::text AS receipts,
+        to_regclass('timer_dead_letters')::text AS "deadLetters",
+        to_regclass('timer_admission')::text AS admission
+    `)
+    const schema = result.rows[0]
+    const missing = [
+      !schema?.slots && 'timer_slots',
+      !schema?.receipts && 'timer_receipts',
+      !schema?.deadLetters && 'timer_dead_letters',
+      !schema?.admission && 'timer_admission',
+    ].filter((table): table is string => typeof table === 'string')
+
+    if (missing.length > 0) {
+      throw new ServiceError(
+        503,
+        'schema_not_ready',
+        `Timer database schema is incomplete (missing ${missing.join(', ')}). Apply migrations/001_init.sql and migrations/002_admission.sql before starting the service`,
+      )
+    }
+
+    // The 002 migration also creates this singleton. Merely finding the table
+    // is insufficient: scheduling cannot admit timers without its row.
+    const admission = await this.pool.query(
+      'SELECT id, window_start, scheduled FROM timer_admission WHERE id = 1',
+    )
+    if (admission.rowCount !== 1) {
+      throw new ServiceError(
+        503,
+        'schema_not_ready',
+        'Timer database schema is incomplete (timer_admission row id=1 is missing). Apply migrations/002_admission.sql before starting the service',
+      )
+    }
   }
 
   async runMigrationFile(path: string): Promise<void> {
@@ -283,6 +322,7 @@ export class PostgresTimerStore implements TimerStore {
           SELECT namespace, timer_key
           FROM timer_slots
           WHERE due_at <= $1
+            AND deliver_until > $1
             AND next_attempt_at <= $1
             AND lane = ANY($2::text[])
             AND (
@@ -322,9 +362,12 @@ export class PostgresTimerStore implements TimerStore {
             AND timer_key = $2
             AND timer_id = $3
             AND generation = $4
+            AND state = 'leased'
+            AND lease_owner = $5
+            AND lease_until = $6
           RETURNING *
         `,
-        [timer.namespace, timer.timerKey, timer.timerId, timer.generation],
+        [timer.namespace, timer.timerKey, timer.timerId, timer.generation, timer.leaseOwner, timer.leaseUntil],
       )
 
       if ((deleted.rowCount ?? 0) === 0) {
@@ -363,7 +406,9 @@ export class PostgresTimerStore implements TimerStore {
           AND timer_key = $2
           AND timer_id = $3
           AND generation = $4
+          AND state = 'leased'
           AND lease_owner = $7
+          AND lease_until = $8
       `,
       [
         timer.namespace,
@@ -373,6 +418,7 @@ export class PostgresTimerStore implements TimerStore {
         options.nextAttemptAt,
         options.now,
         options.ownerId,
+        timer.leaseUntil,
       ],
     )
 
@@ -437,9 +483,12 @@ export class PostgresTimerStore implements TimerStore {
             AND timer_key = $2
             AND timer_id = $3
             AND generation = $4
+            AND state = 'leased'
+            AND lease_owner = $5
+            AND lease_until = $6
           RETURNING *
         `,
-        [timer.namespace, timer.timerKey, timer.timerId, timer.generation],
+        [timer.namespace, timer.timerKey, timer.timerId, timer.generation, timer.leaseOwner, timer.leaseUntil],
       )
 
       const row = deleted.rows[0]
