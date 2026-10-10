@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -302,6 +303,346 @@ test('checked-out transaction disconnect is handled and a fresh connection recov
     assert.match(JSON.stringify(events), /timer_postgres_connection_failed/)
   } finally { await Promise.all([store.close(), admin.end()]) }
 })
+
+test('another worker reclaims a due timer after the previous owner dies with its lease', async () => {
+  const attempts: Array<{ attempt: number; deliveredAt: number }> = []
+  const callback = await startCallbackServer(async (body) => {
+    attempts.push({ attempt: (body as { attempt: number }).attempt, deliveredAt: Date.now() })
+    return { disposition: 'applied' }
+  })
+  const scheduler = await startHarness(callback.url, { workerEnabled: false })
+  const timerId = 'abandoned-lease'
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(Date.now() - 100).toISOString(),
+    deliverUntil: new Date(Date.now() + 10_000).toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const now = new Date()
+    const leaseUntil = new Date(now.getTime() + 400)
+    const abandoned = await store.claimDueTimers({
+      now, ownerId: 'crashed-worker', leaseUntil, lanes: ['realtime'], limit: 1,
+    })
+    assert.equal(abandoned.length, 1)
+    assert.equal(abandoned[0]?.timerId, timerId)
+
+    await startHarness(callback.url)
+    await waitFor(() => attempts.length === 1, 5_000)
+    const firstDelivery = attempts[0]
+    assert.ok(firstDelivery)
+    assert.equal(firstDelivery.attempt, 1)
+    assert.ok(firstDelivery.deliveredAt >= leaseUntil.getTime(), 'a live lease must prevent premature redelivery')
+
+    const receipt = await storeReceipt(timerId)
+    assert.equal(receipt, 'applied')
+  } finally {
+    await store.close()
+  }
+})
+
+test('a successful callback is redelivered if the receipt write fails', async () => {
+  const attempts: Array<{ attempt: number; disposition: string }> = []
+  const callback = await startCallbackServer(async (body) => {
+    const attempt = (body as { attempt: number }).attempt
+    const disposition = attempts.length === 0 ? 'applied' : 'already_applied'
+    attempts.push({ attempt, disposition })
+    return { disposition }
+  })
+  const scheduler = await startHarness(callback.url, { workerEnabled: false })
+  const timerId = 'receipt-write-failure'
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(Date.now() - 100).toISOString(),
+    deliverUntil: new Date(Date.now() + 10_000).toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  let receiptWriteFailures = 0
+  const faultStore = new Proxy(store, {
+    get(target, property) {
+      if (property === 'completeTimer') {
+        return async (...args: Parameters<PostgresTimerStore['completeTimer']>) => {
+          if (receiptWriteFailures === 0) {
+            receiptWriteFailures += 1
+            throw new Error('simulated receipt write failure after callback success')
+          }
+          return target.completeTimer(...args)
+        }
+      }
+      const value = Reflect.get(target, property)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as TimerStore
+  const config = createE2eConfig(callback.url, { leaseMs: 300, pollIntervalMs: 25 })
+  const worker = new TimerWorker(
+    faultStore,
+    new HttpCallbackClient(new StaticCallbackRegistry(config.targets), config.httpClientTimeoutMs),
+    config,
+    createLogger({ service: 'timer-service-e2e-fault', instanceId: config.instanceId }),
+    new TimerMetrics({ instanceId: config.instanceId }),
+  )
+  activeHarnesses.push({ baseUrl: '', stop: async () => { await worker.stop(); await store.close() } })
+  worker.start()
+
+  await waitFor(() => receiptWriteFailures === 1 && attempts.length >= 2, 5_000)
+  await waitForAsync(async () => (await storeReceipt(timerId)) === 'already_applied', 5_000)
+  assert.deepEqual(attempts.map(item => item.disposition), ['applied', 'already_applied'])
+
+  const pool = new Pool({ connectionString: databaseUrl })
+  try {
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM timer_slots')).rows[0].n, 0)
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM timer_dead_letters')).rows[0].n, 0)
+  } finally { await pool.end() }
+})
+
+test('an expired claim cannot retry, complete, or dead-letter a reclaimed timer', async () => {
+  const scheduler = await startHarness('http://unused', { workerEnabled: false })
+  const timerId = 'reclaimed-same-owner'
+  const startedAt = new Date()
+  const deliverUntil = new Date(startedAt.getTime() + 10_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(startedAt.getTime() - 100).toISOString(),
+    deliverUntil: deliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const ownerId = 'same-process-after-restart'
+    const [oldClaim] = await store.claimDueTimers({
+      now: startedAt,
+      ownerId,
+      leaseUntil: new Date(startedAt.getTime() + 1_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.ok(oldClaim)
+    assert.equal(oldClaim.timerId, timerId)
+    const reclaimedAt = new Date(startedAt.getTime() + 1_100)
+    const [newClaim] = await store.claimDueTimers({
+      now: reclaimedAt,
+      ownerId,
+      leaseUntil: new Date(startedAt.getTime() + 20_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.ok(newClaim)
+    assert.equal(newClaim.timerId, timerId)
+    assert.notEqual(newClaim.leaseUntil.getTime(), oldClaim.leaseUntil.getTime())
+
+    const failure = { reason: 'stale_callback_retry' }
+    assert.equal(await store.recordDeliveryFailure(oldClaim, {
+      now: new Date(reclaimedAt.getTime() + 100), ownerId,
+      nextAttemptAt: new Date(reclaimedAt.getTime() + 200), error: failure,
+      receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    }), false)
+    assert.equal(await store.completeTimer(oldClaim, 'applied', {
+      now: new Date(reclaimedAt.getTime() + 200), receiptRetentionMs: 60_000,
+    }), false)
+    assert.equal(await store.recordDeliveryFailure(oldClaim, {
+      now: new Date(deliverUntil.getTime() + 100), ownerId,
+      nextAttemptAt: new Date(deliverUntil.getTime() + 200), error: failure,
+      receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    }), false)
+
+    const verifier = new Pool({ connectionString: databaseUrl })
+    try {
+      const slot = await verifier.query(
+        'SELECT state, lease_owner, lease_until FROM timer_slots WHERE timer_id = $1', [timerId],
+      )
+      assert.equal(slot.rows[0].state, 'leased')
+      assert.equal(slot.rows[0].lease_owner, ownerId)
+      assert.equal((slot.rows[0].lease_until as Date).getTime(), newClaim.leaseUntil.getTime())
+    } finally { await verifier.end() }
+    assert.equal(await store.completeTimer(newClaim, 'applied', {
+      now: new Date(deliverUntil.getTime() + 200), receiptRetentionMs: 60_000,
+    }), true)
+    assert.equal(await storeReceipt(timerId), 'applied')
+  } finally { await store.close() }
+})
+
+test('a database outage makes the API unready and delivery resumes after recovery', async () => {
+  const callbackRequests: unknown[] = []
+  const callback = await startCallbackServer(async (body) => {
+    callbackRequests.push(body)
+    return { disposition: 'applied' }
+  })
+  const harness = await startHarness(callback.url)
+  const timerId = 'database-outage'
+  await postJson(`${harness.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(Date.now() + 1_200).toISOString(),
+    deliverUntil: new Date(Date.now() + 10_000).toISOString(),
+  })
+
+  const databaseName = new URL(databaseUrl).pathname.slice(1)
+  assert.match(databaseName, /^[a-zA-Z][a-zA-Z0-9_]*$/)
+  const adminUrl = new URL(databaseUrl)
+  adminUrl.pathname = '/postgres'
+  const admin = new Pool({ connectionString: adminUrl.toString() })
+  const quotedName = `"${databaseName}"`
+  let disabled = false
+  try {
+    await admin.query(`ALTER DATABASE ${quotedName} WITH ALLOW_CONNECTIONS false`)
+    disabled = true
+    await admin.query(
+      'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()',
+      [databaseName],
+    )
+
+    const unready = await fetch(`${harness.baseUrl}/health/ready`)
+    assert.equal(unready.status, 500)
+    const rejectedSchedule = await request(harness, 'timers', timerInput('during-outage'))
+    assert.equal(rejectedSchedule.status, 500)
+    await new Promise(resolve => setTimeout(resolve, 1_300))
+    assert.equal(callbackRequests.length, 0)
+  } finally {
+    if (disabled) await admin.query(`ALTER DATABASE ${quotedName} WITH ALLOW_CONNECTIONS true`)
+    await admin.end()
+  }
+
+  await waitForAsync(async () => (await fetch(`${harness.baseUrl}/health/ready`)).status === 200, 5_000)
+  await waitFor(() => callbackRequests.length === 1, 5_000)
+  await waitForAsync(async () => (await storeReceipt(timerId)) === 'applied', 5_000)
+})
+
+test('a callback that keeps requesting retry becomes a dead letter at the delivery deadline', async () => {
+  let calls = 0
+  const callback = await startCallbackServer(async () => {
+    calls += 1
+    return { disposition: 'retry' }
+  })
+  const harness = await startHarness(callback.url, {
+    retryBaseMs: 25, retryMaxMs: 25, cleanupIntervalMs: 25,
+  })
+  const timerId = 'delivery-deadline'
+  await postJson(`${harness.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(Date.now() - 100).toISOString(),
+    deliverUntil: new Date(Date.now() + 500).toISOString(),
+  })
+
+  await waitForAsync(async () => (await storeReceipt(timerId)) === 'dead_letter', 5_000)
+  assert.ok(calls >= 1)
+  const pool = new Pool({ connectionString: databaseUrl })
+  try {
+    const slots = await pool.query('SELECT count(*)::int AS n FROM timer_slots')
+    const deadLetters = await pool.query(
+      'SELECT timer_id, last_error->>\'reason\' AS reason FROM timer_dead_letters WHERE timer_id = $1',
+      [timerId],
+    )
+    assert.equal(slots.rows[0].n, 0)
+    assert.equal(deadLetters.rows.length, 1)
+    assert.equal(deadLetters.rows[0].reason, 'deliver_until_expired')
+  } finally { await pool.end() }
+})
+
+test('an already-expired timer is never claimed for delivery and is dead-lettered by cleanup', async () => {
+  const scheduler = await startHarness('http://unused', { workerEnabled: false })
+  const timerId = 'expired-before-claim'
+  const dueAt = new Date(Date.now() + 1_000)
+  const deliverUntil = new Date(dueAt.getTime() + 1_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId), dueAt: dueAt.toISOString(), deliverUntil: deliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  const expiredAt = new Date(deliverUntil.getTime() + 1_000)
+  try {
+    const claimed = await store.claimDueTimers({
+      now: expiredAt,
+      ownerId: 'worker-after-deadline',
+      leaseUntil: new Date(expiredAt.getTime() + 1_000),
+      lanes: ['realtime'],
+      limit: 1,
+    })
+    assert.equal(claimed.length, 0, 'a worker must not send a callback after deliverUntil')
+
+    const cleanup = await store.cleanup({
+      now: expiredAt, limit: 1, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    })
+    assert.equal(cleanup.movedOverdueTimers, 1)
+    assert.equal(await storeReceipt(timerId), 'dead_letter')
+  } finally { await store.close() }
+})
+
+test('startup and readiness reject a database with only migration 001', async () => {
+  const schema = `missing_admission_${process.pid}_${Math.random().toString(16).slice(2)}`
+  const admin = new Pool({ connectionString: databaseUrl })
+  const scopedUrl = new URL(databaseUrl)
+  scopedUrl.searchParams.set('options', `-csearch_path=${schema}`)
+  const scopedDatabaseUrl = scopedUrl.toString()
+  let harness: Harness | undefined
+  try {
+    await admin.query(`CREATE SCHEMA "${schema}"`)
+    const scoped = new Pool({ connectionString: scopedDatabaseUrl })
+    try {
+      assert.equal((await scoped.query('SELECT current_schema() AS schema')).rows[0].schema, schema)
+      await scoped.query(await readFile(join(process.cwd(), 'migrations', '001_init.sql'), 'utf8'))
+    } finally { await scoped.end() }
+
+    const startup = await runMainWithDatabase(scopedDatabaseUrl)
+    assert.equal(startup.exitCode, 1)
+    assert.match(startup.stderr, /timer_service_start_failed/)
+    assert.match(startup.stderr, /002_admission\.sql/)
+    assert.doesNotMatch(startup.stdout, /timer_service_started/)
+
+    harness = await startHarness('http://unused', { databaseUrl: scopedDatabaseUrl, workerEnabled: false })
+    const response = await fetch(`${harness.baseUrl}/health/ready`)
+    assert.equal(response.status, 503)
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'schema_not_ready')
+  } finally {
+    if (harness) await harness.stop()
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`)
+    await admin.end()
+  }
+})
+
+async function runMainWithDatabase(scopedDatabaseUrl: string): Promise<{
+  exitCode: number | null; stdout: string; stderr: string
+}> {
+  const child = spawn(process.execPath, [join(process.cwd(), 'dist', 'src', 'main.js')], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DATABASE_URL: scopedDatabaseUrl,
+      AUTO_MIGRATE: 'false',
+      ALLOW_INSECURE_NO_AUTH: 'true',
+      API_TOKEN: '',
+      WORKER_ENABLED: 'false',
+      TIMER_TARGETS: '{}',
+      PORT: String(20_000 + Math.floor(Math.random() * 30_000)),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', chunk => { stdout += String(chunk) })
+  child.stderr.on('data', chunk => { stderr += String(chunk) })
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    const timeout = setTimeout(() => child.kill(), 3_000)
+    child.once('error', error => { clearTimeout(timeout); reject(error) })
+    child.once('exit', code => { clearTimeout(timeout); resolve(code) })
+  })
+  return { exitCode, stdout, stderr }
+}
+
+async function storeReceipt(timerId: string): Promise<string | null> {
+  const pool = new Pool({ connectionString: databaseUrl })
+  try {
+    const receipt = await pool.query('SELECT disposition FROM timer_receipts WHERE timer_id = $1', [timerId])
+    return receipt.rows[0]?.disposition ?? null
+  } finally { await pool.end() }
+}
+
+async function waitForAsync(predicate: () => Promise<boolean>, timeoutMs = 3000): Promise<void> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.fail('Timed out waiting for condition')
+}
 
 interface Harness {
   readonly baseUrl: string
