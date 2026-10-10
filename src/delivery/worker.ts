@@ -96,10 +96,18 @@ export class TimerWorker {
       const now = new Date()
 
       if (result.kind === 'terminal') {
-        await this.store.completeTimer(timer, result.disposition as ReceiptDisposition, {
+        const completed = await this.store.completeTimer(timer, result.disposition as ReceiptDisposition, {
           now,
           receiptRetentionMs: this.config.receiptRetentionMs,
         })
+        if (!completed) {
+          this.logger.warn('timer_delivery_stale_claim_ignored', {
+            timerId: timer.timerId,
+            timerKey: timer.timerKey,
+            generation: timer.generation,
+          })
+          return
+        }
         this.metrics.recordDeliveryTerminal(result.disposition)
         this.logger.info('timer_delivery_completed', {
           timerId: timer.timerId,
