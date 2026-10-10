@@ -397,6 +397,64 @@ test('a successful callback is redelivered if the receipt write fails', async ()
   } finally { await pool.end() }
 })
 
+test('a killed worker redelivers an in-flight callback without duplicating the consumer effect', async () => {
+  const timerId = 'worker-killed-after-consumer-effect'
+  const callbackRequests: Array<{ timerId: string; generation: number; attempt: number }> = []
+  let appliedEffects = 0
+  let releaseFirstResponse!: () => void
+  const firstResponseGate = new Promise<void>(resolve => { releaseFirstResponse = resolve })
+  const callback = await startCallbackServer(async (body) => {
+    const request = body as { timerId: string; generation: number; attempt: number }
+    callbackRequests.push(request)
+    if (callbackRequests.length === 1) {
+      // The consumer has committed its effect, but the worker has not received an ACK.
+      appliedEffects += 1
+      await firstResponseGate
+      return { disposition: 'applied' }
+    }
+    return { disposition: 'already_applied' }
+  })
+  const scheduler = await startHarness(callback.url, { workerEnabled: false })
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(Date.now() - 100).toISOString(),
+    deliverUntil: new Date(Date.now() + 15_000).toISOString(),
+  })
+
+  try {
+    const crashedWorker = await startWorkerProcess(callback.url, 'chaos-worker-before-crash')
+    await waitFor(() => callbackRequests.length === 1, 5_000)
+    assert.equal(appliedEffects, 1)
+
+    const pool = new Pool({ connectionString: databaseUrl })
+    try {
+      const slot = await pool.query('SELECT state, lease_owner FROM timer_slots WHERE timer_id = $1', [timerId])
+      assert.equal(slot.rows[0]?.state, 'leased')
+      assert.equal(slot.rows[0]?.lease_owner, 'chaos-worker-before-crash')
+      assert.equal(await storeReceipt(timerId), null)
+    } finally { await pool.end() }
+
+    // Kill the actual service process while its HTTP callback is still in flight.
+    await crashedWorker.stop()
+    releaseFirstResponse()
+
+    await startWorkerProcess(callback.url, 'chaos-worker-after-restart')
+    await waitForAsync(async () => (await storeReceipt(timerId)) === 'already_applied', 8_000)
+    assert.equal(appliedEffects, 1)
+    assert.equal(callbackRequests.length, 2)
+    assert.deepEqual(callbackRequests.map(request => request.timerId), [timerId, timerId])
+    assert.deepEqual(callbackRequests.map(request => request.generation), [1, 1])
+
+    const verifier = new Pool({ connectionString: databaseUrl })
+    try {
+      assert.equal((await verifier.query('SELECT count(*)::int AS n FROM timer_slots')).rows[0].n, 0)
+      assert.equal((await verifier.query('SELECT count(*)::int AS n FROM timer_dead_letters')).rows[0].n, 0)
+    } finally { await verifier.end() }
+  } finally {
+    releaseFirstResponse()
+  }
+})
+
 test('an expired claim cannot retry, complete, or dead-letter a reclaimed timer', async () => {
   const scheduler = await startHarness('http://unused', { workerEnabled: false })
   const timerId = 'reclaimed-same-owner'
@@ -625,6 +683,57 @@ async function runMainWithDatabase(scopedDatabaseUrl: string): Promise<{
     child.once('exit', code => { clearTimeout(timeout); resolve(code) })
   })
   return { exitCode, stdout, stderr }
+}
+
+async function startWorkerProcess(callbackUrl: string, instanceId: string): Promise<Harness> {
+  const probe = createServer()
+  await listen(probe)
+  const address = probe.address()
+  if (!address || typeof address === 'string') throw new Error('Failed to reserve a worker port')
+  await closeServer(probe)
+
+  const child = spawn(process.execPath, [join(process.cwd(), 'dist', 'src', 'main.js')], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl,
+      AUTO_MIGRATE: 'false',
+      ALLOW_INSECURE_NO_AUTH: 'true',
+      API_TOKEN: '',
+      WORKER_ENABLED: 'true',
+      TIMER_TARGETS: JSON.stringify({ 'example-worker': callbackUrl }),
+      INSTANCE_ID: instanceId,
+      PORT: String(address.port),
+      LEASE_MS: '500',
+      POLL_INTERVAL_MS: '25',
+      HTTP_CLIENT_TIMEOUT_MS: '5000',
+      CLEANUP_INTERVAL_MS: '60000',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', chunk => { stdout += String(chunk) })
+  child.stderr.on('data', chunk => { stderr += String(chunk) })
+  const exited = new Promise<void>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', () => resolve())
+  })
+  const harness: Harness = {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    stop: async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await exited
+    },
+  }
+  activeHarnesses.push(harness)
+  await waitFor(() => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Worker process exited before startup: ${stdout}\n${stderr}`)
+    }
+    return stdout.includes('timer_service_started')
+  }, 5_000)
+  return harness
 }
 
 async function storeReceipt(timerId: string): Promise<string | null> {
