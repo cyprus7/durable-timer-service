@@ -352,10 +352,10 @@ export class PostgresTimerStore implements TimerStore {
   }
 
   async getBacklogSnapshot(options: BacklogSnapshotOptions): Promise<BacklogSnapshot> {
-    // Use the same eligibility predicate as claimDueTimers. All replicas sample
-    // the shared backlog, so dashboards should aggregate these gauges with max.
-    const result = await this.pool.query<{ due_timers: string; oldest_due_at: Date | null }>(
-      `SELECT count(*)::text AS due_timers, min(due_at) AS oldest_due_at
+    // Use the same eligibility predicate as claimDueTimers. Group once by lane
+    // so overlapping replica lane sets can be deduplicated in Prometheus.
+    const result = await this.pool.query<{ lane: string; due_timers: string; oldest_due_at: Date | null }>(
+      `SELECT lane, count(*)::text AS due_timers, min(due_at) AS oldest_due_at
        FROM timer_slots
        WHERE due_at <= $1
          AND deliver_until > $1
@@ -364,13 +364,27 @@ export class PostgresTimerStore implements TimerStore {
          AND (
            state = 'scheduled'
            OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until <= $1)
-         )`,
+         )
+       GROUP BY lane`,
       [options.now, options.lanes],
     )
 
+    const byLane = new Map(result.rows.map((row) => [row.lane, {
+      lane: row.lane,
+      dueTimers: Number(row.due_timers),
+      oldestDueAt: row.oldest_due_at,
+    }]))
+    const lanes = [...new Set(options.lanes)].map((lane) => byLane.get(lane) ?? {
+      lane, dueTimers: 0, oldestDueAt: null,
+    })
+
     return {
-      dueTimers: Number(result.rows[0]!.due_timers),
-      oldestDueAt: result.rows[0]!.oldest_due_at,
+      dueTimers: lanes.reduce((sum, lane) => sum + lane.dueTimers, 0),
+      oldestDueAt: lanes.reduce<Date | null>((oldest, lane) => {
+        if (!lane.oldestDueAt) return oldest
+        return !oldest || lane.oldestDueAt < oldest ? lane.oldestDueAt : oldest
+      }, null),
+      byLane: lanes,
     }
   }
 

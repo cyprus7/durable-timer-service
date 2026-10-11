@@ -6,7 +6,14 @@ export class TimerMetrics {
   private readonly registry = new MetricsRegistry()
   private readonly startedAt = Date.now()
 
-  constructor(private readonly labels: { readonly instanceId: string }) {}
+  constructor(private readonly labels: { readonly instanceId: string }) {
+    this.registry.set(
+      'timer_service_last_dead_letter_timestamp_seconds',
+      'Unix time of the most recent timer moved to dead letters in this process.',
+      {},
+      0,
+    )
+  }
 
   recordSchedule(status: string): void {
     this.registry.inc('timer_service_schedules_total', 'Timer schedule requests by result status.', { status })
@@ -33,16 +40,26 @@ export class TimerMetrics {
     }
   }
 
-  recordDeliveryStarted(dueAt: Date, startedAt = new Date()): void {
+  recordDeliveryStarted(dueAt: Date, startedAt = new Date(), attempt?: number): void {
     this.registry.inc('timer_service_delivery_attempts_total', 'Timer delivery attempts.', {})
     this.registry.incGauge('timer_service_inflight_deliveries', 'Current in-flight timer deliveries.', {}, 1)
+    const lagSeconds = Math.max(0, startedAt.getTime() - dueAt.getTime()) / 1000
     this.registry.observe(
       'timer_service_delivery_start_lag_seconds',
       'Seconds between timer due time and the start of a delivery attempt.',
       {},
-      Math.max(0, startedAt.getTime() - dueAt.getTime()) / 1000,
+      lagSeconds,
       DELIVERY_START_LAG_BUCKETS_SECONDS,
     )
+    if (attempt === 0) {
+      this.registry.observe(
+        'timer_service_delivery_start_lag_attempt_zero_seconds',
+        'Seconds between timer due time and a delivery start with no recorded failures.',
+        {},
+        lagSeconds,
+        DELIVERY_START_LAG_BUCKETS_SECONDS,
+      )
+    }
   }
 
   recordDeliveryTerminal(disposition: string): void {
@@ -64,6 +81,7 @@ export class TimerMetrics {
       result: 'dead_letter',
       reason,
     })
+    this.recordDeadLetterTimestamp()
   }
 
   recordDeliveryFinished(): void {
@@ -74,9 +92,21 @@ export class TimerMetrics {
     this.registry.inc('timer_service_delivery_task_failures_total', 'Timer delivery tasks rejected by an unexpected error.', {})
   }
 
-  recordBacklogSnapshot(input: { readonly dueTimers: number; readonly oldestDueSeconds: number }, sampledAt: Date): void {
+  recordBacklogSnapshot(input: {
+    readonly dueTimers: number
+    readonly oldestDueSeconds: number
+    readonly byLane?: readonly {
+      readonly lane: string
+      readonly dueTimers: number
+      readonly oldestDueSeconds: number
+    }[]
+  }, sampledAt: Date): void {
     this.registry.set('timer_service_due_backlog_timers', 'Due timers eligible for a new claim in this instance\'s lanes.', {}, input.dueTimers)
     this.registry.set('timer_service_oldest_due_seconds', 'Age in seconds of the oldest due timer eligible for a new claim.', {}, input.oldestDueSeconds)
+    for (const lane of input.byLane ?? []) {
+      this.registry.set('timer_service_due_backlog_by_lane_timers', 'Due timers eligible for a new claim in this lane.', { lane: lane.lane }, lane.dueTimers)
+      this.registry.set('timer_service_oldest_due_by_lane_seconds', 'Age in seconds of the oldest due timer eligible for a new claim in this lane.', { lane: lane.lane }, lane.oldestDueSeconds)
+    }
     this.registry.set('timer_service_backlog_sample_success', 'Whether the most recent backlog sample succeeded.', {}, 1)
     this.registry.set('timer_service_backlog_sample_timestamp_seconds', 'Unix time of the most recent successful backlog sample.', {}, sampledAt.getTime() / 1000)
   }
@@ -100,6 +130,18 @@ export class TimerMetrics {
     this.registry.inc('timer_service_cleanup_items_total', 'Timer cleanup items by kind.', {
       kind: 'expired_dead_letters',
     }, input.expiredDeadLetters)
+    if (input.movedOverdueTimers > 0) {
+      this.recordDeadLetterTimestamp()
+    }
+  }
+
+  private recordDeadLetterTimestamp(): void {
+    this.registry.set(
+      'timer_service_last_dead_letter_timestamp_seconds',
+      'Unix time of the most recent timer moved to dead letters in this process.',
+      {},
+      Date.now() / 1000,
+    )
   }
 
   render(): string {

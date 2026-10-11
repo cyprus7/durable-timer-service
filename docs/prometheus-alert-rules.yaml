@@ -2,14 +2,14 @@ groups:
   - name: durable-timer-service
     rules:
       - alert: DurableTimerDueBacklogHigh
-        expr: max(timer_service_due_backlog_timers) > 1000
+        expr: sum(max by (lane) (timer_service_due_backlog_by_lane_timers)) > 1000
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: More than 1000 timers are eligible for delivery
       - alert: DurableTimerOldestDueHigh
-        expr: max(timer_service_oldest_due_seconds) > 30
+        expr: max(max by (lane) (timer_service_oldest_due_by_lane_seconds)) > 30
         for: 2m
         labels:
           severity: warning
@@ -30,12 +30,18 @@ groups:
         annotations:
           summary: A timer replica has not refreshed its backlog sample
       - alert: DurableTimerDeadLetters
-        expr: sum(increase(timer_service_deliveries_total{result="dead_letter"}[5m])) > 0
+        expr: >-
+          ((max(max_over_time(timer_service_last_dead_letter_timestamp_seconds[5m])) > 0)
+          and (time() - max(max_over_time(timer_service_last_dead_letter_timestamp_seconds[5m])) < 300))
+          or
+          (sum(increase(timer_service_deliveries_total{result="dead_letter"}[5m])) > 0)
+          or
+          (sum(increase(timer_service_cleanup_items_total{kind="moved_overdue_timers"}[5m])) > 0)
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: Timer delivery moved a timer to dead letters
+          summary: A timer moved to dead letters
       - alert: DurableTimerUnexpectedDeliveryTaskFailure
         expr: sum(increase(timer_service_delivery_task_failures_total[5m])) > 0
         for: 0m

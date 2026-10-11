@@ -29,13 +29,45 @@ test('delivery start lag histogram uses cumulative fixed buckets and clamps earl
   assert.match(text, /timer_service_delivery_attempts_total 6/)
 })
 
+test('attempt-zero lag excludes recorded retries while retaining all-attempt lag', () => {
+  const metrics = new TimerMetrics({ instanceId: 'attempt-zero-test' })
+  const dueAt = new Date('2026-01-01T00:00:00.000Z')
+
+  metrics.recordDeliveryStarted(dueAt, new Date(dueAt.getTime() + 50), 0)
+  metrics.recordDeliveryStarted(dueAt, new Date(dueAt.getTime() + 5_000), 1)
+  metrics.recordDeliveryStarted(dueAt, new Date(dueAt.getTime() + 100), 0)
+
+  const text = metrics.render()
+  assert.match(text, /timer_service_delivery_start_lag_seconds_count 3/)
+  assert.match(text, /timer_service_delivery_start_lag_attempt_zero_seconds_count 2/)
+  assert.match(text, /timer_service_delivery_start_lag_attempt_zero_seconds_bucket\{le="0\.1"\} 2/)
+  assert.match(text, /timer_service_delivery_attempts_total 3/)
+  const allAttemptsSum = Number(text.match(/timer_service_delivery_start_lag_seconds_sum ([^\n]+)/)?.[1])
+  const attemptZeroSum = Number(text.match(/timer_service_delivery_start_lag_attempt_zero_seconds_sum ([^\n]+)/)?.[1])
+  assert.ok(Math.abs(allAttemptsSum - 5.15) < 1e-9)
+  assert.ok(Math.abs(attemptZeroSum - 0.15) < 1e-9)
+})
+
 test('backlog gauges expose a fresh shared snapshot and failed samples', () => {
   const metrics = new TimerMetrics({ instanceId: 'backlog-test' })
   const sampledAt = new Date('2026-01-01T00:00:00.000Z')
-  metrics.recordBacklogSnapshot({ dueTimers: 3, oldestDueSeconds: 12.5 }, sampledAt)
+  metrics.recordBacklogSnapshot({
+    dueTimers: 3,
+    oldestDueSeconds: 12.5,
+    byLane: [
+      { lane: 'realtime', dueTimers: 2, oldestDueSeconds: 12.5 },
+      { lane: 'background', dueTimers: 1, oldestDueSeconds: 4 },
+      { lane: 'empty', dueTimers: 0, oldestDueSeconds: 0 },
+    ],
+  }, sampledAt)
   let output = metrics.render()
   assert.match(output, /timer_service_due_backlog_timers 3/)
   assert.match(output, /timer_service_oldest_due_seconds 12\.5/)
+  assert.match(output, /timer_service_due_backlog_by_lane_timers\{lane="realtime"\} 2/)
+  assert.match(output, /timer_service_due_backlog_by_lane_timers\{lane="background"\} 1/)
+  assert.match(output, /timer_service_due_backlog_by_lane_timers\{lane="empty"\} 0/)
+  assert.match(output, /timer_service_oldest_due_by_lane_seconds\{lane="background"\} 4/)
+  assert.match(output, /timer_service_oldest_due_by_lane_seconds\{lane="empty"\} 0/)
   assert.match(output, /timer_service_backlog_sample_success 1/)
   assert.match(output, /timer_service_backlog_sample_timestamp_seconds 1767225600/)
 
@@ -44,4 +76,49 @@ test('backlog gauges expose a fresh shared snapshot and failed samples', () => {
   assert.match(output, /timer_service_backlog_sample_success 0/)
   assert.match(output, /timer_service_backlog_sample_failures_total 1/)
   assert.match(output, /timer_service_backlog_sample_timestamp_seconds 1767225600/)
+
+  metrics.recordBacklogSnapshot({
+    dueTimers: 1,
+    oldestDueSeconds: 2,
+    byLane: [
+      { lane: 'realtime', dueTimers: 0, oldestDueSeconds: 0 },
+      { lane: 'background', dueTimers: 1, oldestDueSeconds: 2 },
+      { lane: 'empty', dueTimers: 0, oldestDueSeconds: 0 },
+    ],
+  }, new Date(sampledAt.getTime() + 10_000))
+  output = metrics.render()
+  assert.match(output, /timer_service_due_backlog_timers 1/)
+  assert.match(output, /timer_service_due_backlog_by_lane_timers\{lane="realtime"\} 0/)
+  assert.match(output, /timer_service_oldest_due_by_lane_seconds\{lane="realtime"\} 0/)
+  assert.match(output, /timer_service_backlog_sample_success 1/)
+  assert.match(output, /timer_service_backlog_sample_timestamp_seconds 1767225610/)
+})
+
+test('dead-letter timestamp is exported before any event and records both transition paths', () => {
+  const cleanupMetrics = new TimerMetrics({ instanceId: 'cleanup-dead-letter-test' })
+  assert.match(cleanupMetrics.render(), /timer_service_last_dead_letter_timestamp_seconds 0/)
+
+  cleanupMetrics.recordCleanup({ movedOverdueTimers: 0, expiredReceipts: 2, expiredDeadLetters: 0 })
+  assert.match(cleanupMetrics.render(), /timer_service_last_dead_letter_timestamp_seconds 0/)
+
+  const beforeCleanup = Date.now() / 1000
+  cleanupMetrics.recordCleanup({ movedOverdueTimers: 1, expiredReceipts: 0, expiredDeadLetters: 0 })
+  const afterCleanup = Date.now() / 1000
+  const cleanupOutput = cleanupMetrics.render()
+  const cleanupTimestamp = Number(cleanupOutput.match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+  assert.ok(cleanupTimestamp >= beforeCleanup && cleanupTimestamp <= afterCleanup)
+  assert.match(cleanupOutput, /timer_service_cleanup_items_total\{kind="moved_overdue_timers"\} 1/)
+
+  cleanupMetrics.recordCleanup({ movedOverdueTimers: 0, expiredReceipts: 0, expiredDeadLetters: 0 })
+  const afterNoopTimestamp = Number(cleanupMetrics.render().match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+  assert.equal(afterNoopTimestamp, cleanupTimestamp)
+
+  const deliveryMetrics = new TimerMetrics({ instanceId: 'delivery-dead-letter-test' })
+  const beforeDelivery = Date.now() / 1000
+  deliveryMetrics.recordDeliveryDeadLetter('callback_failed')
+  const afterDelivery = Date.now() / 1000
+  const deliveryOutput = deliveryMetrics.render()
+  const deliveryTimestamp = Number(deliveryOutput.match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+  assert.ok(deliveryTimestamp >= beforeDelivery && deliveryTimestamp <= afterDelivery)
+  assert.match(deliveryOutput, /timer_service_deliveries_total\{reason="callback_failed",result="dead_letter"\} 1/)
 })

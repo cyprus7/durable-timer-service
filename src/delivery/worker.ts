@@ -118,6 +118,13 @@ export class TimerWorker {
           oldestDueSeconds: snapshot.oldestDueAt
             ? Math.max(0, now.getTime() - snapshot.oldestDueAt.getTime()) / 1000
             : 0,
+          byLane: (snapshot.byLane ?? []).map((lane) => ({
+            lane: lane.lane,
+            dueTimers: lane.dueTimers,
+            oldestDueSeconds: lane.oldestDueAt
+              ? Math.max(0, now.getTime() - lane.oldestDueAt.getTime()) / 1000
+              : 0,
+          })),
         }, now)
       } catch (error) {
         this.metrics.recordBacklogSampleFailure()
@@ -129,7 +136,7 @@ export class TimerWorker {
 
   private async deliver(timer: ClaimedTimer): Promise<void> {
     const startedAt = new Date()
-    this.metrics.recordDeliveryStarted(timer.dueAt, startedAt)
+    this.metrics.recordDeliveryStarted(timer.dueAt, startedAt, timer.attempt)
 
     try {
       const result = await this.callbackClient.deliver(timer)

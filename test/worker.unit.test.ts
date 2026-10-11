@@ -120,11 +120,13 @@ test('a callback from a stale lease is not reported as a completed delivery', as
   }
 
   await (worker as unknown as { deliver(timer: ClaimedTimer): Promise<void> }).deliver(timer)
+  await (worker as unknown as { deliver(timer: ClaimedTimer): Promise<void> }).deliver({ ...timer, attempt: 1 })
 
   assert.deepEqual(infos, [])
-  assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored'])
+  assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored', 'timer_delivery_stale_claim_ignored'])
   assert.doesNotMatch(metrics.render(), /timer_service_deliveries_total/)
-  assert.match(metrics.render(), /timer_service_delivery_start_lag_seconds_count 1/)
+  assert.match(metrics.render(), /timer_service_delivery_start_lag_seconds_count 2/)
+  assert.match(metrics.render(), /timer_service_delivery_start_lag_attempt_zero_seconds_count 1/)
 })
 
 test('a rejected delivery task is reported while another timer in the batch completes', async () => {
@@ -227,7 +229,11 @@ test('backlog sampling recovers from transient failures and records metrics', as
       }
       // Recovery succeeds on next attempts
       resolveReady?.()
-      return { dueTimers: 5, oldestDueAt: new Date(Date.now() - 1000) }
+      return {
+        dueTimers: 5,
+        oldestDueAt: new Date(Date.now() - 1000),
+        byLane: [{ lane: 'realtime', dueTimers: 5, oldestDueAt: new Date(Date.now() - 1000) }],
+      }
     },
   } as unknown as TimerStore
   const callbackClient = {} as HttpCallbackClient
@@ -283,6 +289,7 @@ test('backlog sampling recovers from transient failures and records metrics', as
     assert.match(metricsOutput, /timer_service_backlog_sample_failures_total 1/)
     assert.match(metricsOutput, /timer_service_backlog_sample_success 1/)
     assert.match(metricsOutput, /timer_service_due_backlog_timers 5/)
+    assert.match(metricsOutput, /timer_service_due_backlog_by_lane_timers\{lane="realtime"\} 5/)
   } finally {
     if (recoveryTimeout !== undefined) {
       clearTimeout(recoveryTimeout)
