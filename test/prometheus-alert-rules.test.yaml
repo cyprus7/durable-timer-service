@@ -35,3 +35,48 @@ tests:
               severity: warning
             exp_annotations:
               summary: A timer moved to dead letters
+
+  - interval: 1m
+    input_series:
+      - series: 'timer_service_due_backlog_by_lane_timers{lane="realtime",instance="a"}'
+        values: '600 600 600 600 600 600 600'
+      - series: 'timer_service_due_backlog_by_lane_timers{lane="realtime",instance="b"}'
+        values: '600 600 600 600 600 600 600'
+      - series: 'timer_service_due_backlog_by_lane_timers{lane="background",instance="c"}'
+        values: '500 500 500 500 500 500 500'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: DurableTimerDueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: More than 1000 timers are eligible for delivery
+
+  - interval: 1m
+    input_series:
+      - series: 'timer_service_due_backlog_by_lane_timers{lane="realtime",instance="a"}'
+        values: '600 600 600 600 600 600 600'
+      - series: 'timer_service_due_backlog_by_lane_timers{lane="realtime",instance="b"}'
+        values: '600 600 600 600 600 600 600'
+      - series: 'timer_service_due_backlog_by_lane_timers{lane="background",instance="c"}'
+        values: '300 300 300 300 300 300 300'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: DurableTimerDueBacklogHigh
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'timer_service_oldest_due_by_lane_seconds{lane="realtime",instance="a"}'
+        values: '10 10 10 10'
+      - series: 'timer_service_oldest_due_by_lane_seconds{lane="background",instance="b"}'
+        values: '40 40 40 40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DurableTimerOldestDueHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: The oldest claimable timer is over 30 seconds late
