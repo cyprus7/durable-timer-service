@@ -595,6 +595,198 @@ test('a callback that keeps requesting retry becomes a dead letter at the delive
   } finally { await pool.end() }
 })
 
+test('cleanup preserves an in-flight callback past deliverUntil while its lease is active', async () => {
+  let callbackStarted!: () => void
+  let releaseCallback!: () => void
+  const started = new Promise<void>((resolve) => { callbackStarted = resolve })
+  const released = new Promise<void>((resolve) => { releaseCallback = resolve })
+  const callback = await startCallbackServer(async () => {
+    callbackStarted()
+    await released
+    return { disposition: 'applied' }
+  })
+  const scheduler = await startHarness(callback.url, { workerEnabled: false })
+  const timerId = 'in-flight-at-deadline'
+  const now = new Date()
+  const deliverUntil = new Date(now.getTime() + 10_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(now.getTime() - 100).toISOString(),
+    deliverUntil: deliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const [claim] = await store.claimDueTimers({
+      now, ownerId: 'in-flight-worker',
+      leaseUntil: new Date(now.getTime() + 20_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.ok(claim)
+    const client = new HttpCallbackClient(
+      new StaticCallbackRegistry(new Map([['example-worker', callback.url]])), 5_000,
+    )
+    const delivery = client.deliver(claim)
+    await Promise.race([
+      started,
+      delivery.then((result) => { assert.fail(`Callback ended before it started: ${JSON.stringify(result)}`) }),
+    ])
+
+    const afterDeadline = new Date(deliverUntil.getTime() + 1)
+    const cleanup = await store.cleanup({
+      now: afterDeadline, limit: 1, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    })
+    assert.equal(cleanup.movedOverdueTimers, 0)
+    assert.equal(await storeReceipt(timerId), null)
+
+    releaseCallback()
+    assert.deepEqual(await delivery, { kind: 'terminal', disposition: 'applied' })
+    assert.equal(await store.completeTimer(claim, 'applied', {
+      now: afterDeadline, receiptRetentionMs: 60_000,
+    }), true)
+    assert.equal(await storeReceipt(timerId), 'applied')
+    const pool = new Pool({ connectionString: databaseUrl })
+    try {
+      const deadLetters = await pool.query('SELECT count(*)::int AS n FROM timer_dead_letters WHERE timer_id = $1', [timerId])
+      assert.equal(deadLetters.rows[0].n, 0)
+    } finally { await pool.end() }
+  } finally {
+    releaseCallback()
+    await store.close()
+  }
+})
+
+test('cleanup batch preserves an active lease while dead-lettering expired and unleased overdue timers', async () => {
+  let callbackStarted!: () => void
+  let releaseCallback!: () => void
+  let callbackReleased = false
+  const started = new Promise<void>((resolve) => { callbackStarted = resolve })
+  const released = new Promise<void>((resolve) => { releaseCallback = resolve })
+  const releaseCallbackOnce = () => {
+    if (!callbackReleased) {
+      callbackReleased = true
+      releaseCallback()
+    }
+  }
+  const callback = await startCallbackServer(async () => {
+    callbackStarted()
+    await released
+    return { disposition: 'applied' }
+  })
+  const scheduler = await startHarness(callback.url, { workerEnabled: false })
+  const now = new Date()
+  const activeTimerId = 'cleanup-batch-active-lease'
+  const expiredLeaseTimerId = 'cleanup-batch-expired-lease'
+  const unleasedTimerId = 'cleanup-batch-unleased'
+  const activeDeliverUntil = new Date(now.getTime() + 30_000)
+  const expiredDeliverUntil = new Date(now.getTime() + 10_000)
+  const cleanupNow = new Date(now.getTime() + 40_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(activeTimerId),
+    dueAt: new Date(now.getTime() - 300).toISOString(),
+    deliverUntil: activeDeliverUntil.toISOString(),
+  })
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(expiredLeaseTimerId),
+    dueAt: new Date(now.getTime() - 200).toISOString(),
+    deliverUntil: expiredDeliverUntil.toISOString(),
+  })
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(unleasedTimerId),
+    dueAt: new Date(now.getTime() - 100).toISOString(),
+    deliverUntil: expiredDeliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  let delivery: ReturnType<HttpCallbackClient['deliver']> | undefined
+  try {
+    const [activeClaim] = await store.claimDueTimers({
+      now, ownerId: 'cleanup-batch-active-worker',
+      leaseUntil: new Date(now.getTime() + 90_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.equal(activeClaim?.timerId, activeTimerId)
+    const [expiredClaim] = await store.claimDueTimers({
+      now, ownerId: 'cleanup-batch-expired-worker',
+      leaseUntil: new Date(now.getTime() + 15_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.equal(expiredClaim?.timerId, expiredLeaseTimerId)
+    const client = new HttpCallbackClient(
+      new StaticCallbackRegistry(new Map([['example-worker', callback.url]])), 5_000,
+    )
+    delivery = client.deliver(activeClaim)
+    await Promise.race([
+      started,
+      delivery.then((result) => { assert.fail(`Callback ended before it started: ${JSON.stringify(result)}`) }),
+    ])
+
+    const cleanup = await store.cleanup({
+      now: cleanupNow, limit: 10, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    })
+    assert.equal(cleanup.movedOverdueTimers, 2)
+    assert.equal(await storeReceipt(activeTimerId), null)
+    assert.equal(await storeReceipt(expiredLeaseTimerId), 'dead_letter')
+    assert.equal(await storeReceipt(unleasedTimerId), 'dead_letter')
+
+    const pool = new Pool({ connectionString: databaseUrl })
+    try {
+      const activeSlot = await pool.query(
+        'SELECT state, lease_owner FROM timer_slots WHERE timer_id = $1',
+        [activeTimerId],
+      )
+      assert.equal(activeSlot.rows[0]?.state, 'leased')
+      assert.equal(activeSlot.rows[0]?.lease_owner, 'cleanup-batch-active-worker')
+      const activeDeadLetters = await pool.query(
+        'SELECT count(*)::int AS n FROM timer_dead_letters WHERE timer_id = $1',
+        [activeTimerId],
+      )
+      assert.equal(activeDeadLetters.rows[0].n, 0)
+    } finally { await pool.end() }
+
+    releaseCallbackOnce()
+    assert.deepEqual(await delivery, { kind: 'terminal', disposition: 'applied' })
+    assert.equal(await store.completeTimer(activeClaim, 'applied', {
+      now: cleanupNow, receiptRetentionMs: 60_000,
+    }), true)
+    assert.equal(await storeReceipt(activeTimerId), 'applied')
+  } finally {
+    releaseCallbackOnce()
+    if (delivery) {
+      await delivery.catch(() => undefined)
+    }
+    await store.close()
+  }
+})
+
+test('cleanup dead-letters an overdue timer after its delivery lease expires', async () => {
+  const scheduler = await startHarness('http://unused', { workerEnabled: false })
+  const timerId = 'expired-lease-at-deadline'
+  const now = new Date()
+  const deliverUntil = new Date(now.getTime() + 10_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(now.getTime() - 100).toISOString(),
+    deliverUntil: deliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const [claim] = await store.claimDueTimers({
+      now, ownerId: 'expired-lease-worker',
+      leaseUntil: new Date(deliverUntil.getTime() + 1_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.ok(claim)
+    const cleanup = await store.cleanup({
+      now: new Date(deliverUntil.getTime() + 1_001),
+      limit: 1, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    })
+    assert.equal(cleanup.movedOverdueTimers, 1)
+    assert.equal(await storeReceipt(timerId), 'dead_letter')
+  } finally { await store.close() }
+})
+
 test('an already-expired timer is never claimed for delivery and is dead-lettered by cleanup', async () => {
   const scheduler = await startHarness('http://unused', { workerEnabled: false })
   const timerId = 'expired-before-claim'
