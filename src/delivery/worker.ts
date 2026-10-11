@@ -105,7 +105,8 @@ export class TimerWorker {
   }
 
   private async deliver(timer: ClaimedTimer): Promise<void> {
-    this.metrics.recordDeliveryStarted()
+    const startedAt = new Date()
+    this.metrics.recordDeliveryStarted(timer.dueAt, startedAt)
 
     try {
       const result = await this.callbackClient.deliver(timer)

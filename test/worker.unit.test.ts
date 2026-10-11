@@ -123,6 +123,7 @@ test('a callback from a stale lease is not reported as a completed delivery', as
   assert.deepEqual(infos, [])
   assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored'])
   assert.doesNotMatch(metrics.render(), /timer_service_deliveries_total/)
+  assert.match(metrics.render(), /timer_service_delivery_start_lag_seconds_count 1/)
 })
 
 test('a rejected delivery task is reported while another timer in the batch completes', async () => {

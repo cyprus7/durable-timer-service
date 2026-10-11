@@ -154,6 +154,7 @@ Cancellation must match both `timerId` and `generation`.
 - `GET /health/live` reports process liveness.
 - `GET /health/ready` checks database connectivity and the required tables and admission row. An incomplete schema returns 503 with code `schema_not_ready`; startup also fails before listening when a migration is missing.
 - `GET /metrics` exposes Prometheus text metrics.
+- `timer_service_delivery_start_lag_seconds` is a fixed-bucket histogram of the time from `dueAt` to the start of each delivery attempt (including retries). Negative lag is recorded as zero. It has no timer-specific labels.
 
 Protect health and metrics endpoints at the network perimeter when they are not intended to be public.
 
