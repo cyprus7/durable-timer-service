@@ -93,3 +93,32 @@ test('backlog gauges expose a fresh shared snapshot and failed samples', () => {
   assert.match(output, /timer_service_backlog_sample_success 1/)
   assert.match(output, /timer_service_backlog_sample_timestamp_seconds 1767225610/)
 })
+
+test('dead-letter timestamp is exported before any event and records both transition paths', () => {
+  const cleanupMetrics = new TimerMetrics({ instanceId: 'cleanup-dead-letter-test' })
+  assert.match(cleanupMetrics.render(), /timer_service_last_dead_letter_timestamp_seconds 0/)
+
+  cleanupMetrics.recordCleanup({ movedOverdueTimers: 0, expiredReceipts: 2, expiredDeadLetters: 0 })
+  assert.match(cleanupMetrics.render(), /timer_service_last_dead_letter_timestamp_seconds 0/)
+
+  const beforeCleanup = Date.now() / 1000
+  cleanupMetrics.recordCleanup({ movedOverdueTimers: 1, expiredReceipts: 0, expiredDeadLetters: 0 })
+  const afterCleanup = Date.now() / 1000
+  const cleanupOutput = cleanupMetrics.render()
+  const cleanupTimestamp = Number(cleanupOutput.match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+  assert.ok(cleanupTimestamp >= beforeCleanup && cleanupTimestamp <= afterCleanup)
+  assert.match(cleanupOutput, /timer_service_cleanup_items_total\{kind="moved_overdue_timers"\} 1/)
+
+  cleanupMetrics.recordCleanup({ movedOverdueTimers: 0, expiredReceipts: 0, expiredDeadLetters: 0 })
+  const afterNoopTimestamp = Number(cleanupMetrics.render().match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+  assert.equal(afterNoopTimestamp, cleanupTimestamp)
+
+  const deliveryMetrics = new TimerMetrics({ instanceId: 'delivery-dead-letter-test' })
+  const beforeDelivery = Date.now() / 1000
+  deliveryMetrics.recordDeliveryDeadLetter('callback_failed')
+  const afterDelivery = Date.now() / 1000
+  const deliveryOutput = deliveryMetrics.render()
+  const deliveryTimestamp = Number(deliveryOutput.match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+  assert.ok(deliveryTimestamp >= beforeDelivery && deliveryTimestamp <= afterDelivery)
+  assert.match(deliveryOutput, /timer_service_deliveries_total\{reason="callback_failed",result="dead_letter"\} 1/)
+})

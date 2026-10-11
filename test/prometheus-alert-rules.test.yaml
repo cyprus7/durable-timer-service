@@ -8,6 +8,8 @@ tests:
     input_series:
       - series: 'timer_service_deliveries_total{result="dead_letter",reason="callback_failed"}'
         values: '0 0 1 1 1'
+      - series: 'timer_service_last_dead_letter_timestamp_seconds'
+        values: '0 0 0 0 0'
     alert_rule_test:
       - eval_time: 1m
         alertname: DurableTimerDeadLetters
@@ -24,6 +26,8 @@ tests:
     input_series:
       - series: 'timer_service_cleanup_items_total{kind="moved_overdue_timers"}'
         values: '0 0 1 1 1'
+      - series: 'timer_service_last_dead_letter_timestamp_seconds'
+        values: '0 0 0 0 0'
     alert_rule_test:
       - eval_time: 1m
         alertname: DurableTimerDeadLetters
@@ -35,6 +39,41 @@ tests:
               severity: warning
             exp_annotations:
               summary: A timer moved to dead letters
+
+  - interval: 1m
+    input_series:
+      - series: 'timer_service_last_dead_letter_timestamp_seconds'
+        values: '_ _ 120 120 120 120 120 120 120 120'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: DurableTimerDeadLetters
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DurableTimerDeadLetters
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: A timer moved to dead letters
+      - eval_time: 9m
+        alertname: DurableTimerDeadLetters
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'timer_service_last_dead_letter_timestamp_seconds'
+        values: '0 0 120 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DurableTimerDeadLetters
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: A timer moved to dead letters
+      - eval_time: 9m
+        alertname: DurableTimerDeadLetters
+        exp_alerts: []
 
   - interval: 1m
     input_series:

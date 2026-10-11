@@ -31,6 +31,9 @@ groups:
           summary: A timer replica has not refreshed its backlog sample
       - alert: DurableTimerDeadLetters
         expr: >-
+          ((max(max_over_time(timer_service_last_dead_letter_timestamp_seconds[5m])) > 0)
+          and (time() - max(max_over_time(timer_service_last_dead_letter_timestamp_seconds[5m])) < 300))
+          or
           (sum(increase(timer_service_deliveries_total{result="dead_letter"}[5m])) > 0)
           or
           (sum(increase(timer_service_cleanup_items_total{kind="moved_overdue_timers"}[5m])) > 0)

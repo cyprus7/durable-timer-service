@@ -6,7 +6,14 @@ export class TimerMetrics {
   private readonly registry = new MetricsRegistry()
   private readonly startedAt = Date.now()
 
-  constructor(private readonly labels: { readonly instanceId: string }) {}
+  constructor(private readonly labels: { readonly instanceId: string }) {
+    this.registry.set(
+      'timer_service_last_dead_letter_timestamp_seconds',
+      'Unix time of the most recent timer moved to dead letters in this process.',
+      {},
+      0,
+    )
+  }
 
   recordSchedule(status: string): void {
     this.registry.inc('timer_service_schedules_total', 'Timer schedule requests by result status.', { status })
@@ -74,6 +81,7 @@ export class TimerMetrics {
       result: 'dead_letter',
       reason,
     })
+    this.recordDeadLetterTimestamp()
   }
 
   recordDeliveryFinished(): void {
@@ -122,6 +130,18 @@ export class TimerMetrics {
     this.registry.inc('timer_service_cleanup_items_total', 'Timer cleanup items by kind.', {
       kind: 'expired_dead_letters',
     }, input.expiredDeadLetters)
+    if (input.movedOverdueTimers > 0) {
+      this.recordDeadLetterTimestamp()
+    }
+  }
+
+  private recordDeadLetterTimestamp(): void {
+    this.registry.set(
+      'timer_service_last_dead_letter_timestamp_seconds',
+      'Unix time of the most recent timer moved to dead letters in this process.',
+      {},
+      Date.now() / 1000,
+    )
   }
 
   render(): string {
