@@ -1,0 +1,45 @@
+groups:
+  - name: durable-timer-service
+    rules:
+      - alert: DurableTimerDueBacklogHigh
+        expr: max(timer_service_due_backlog_timers) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 1000 timers are eligible for delivery
+      - alert: DurableTimerOldestDueHigh
+        expr: max(timer_service_oldest_due_seconds) > 30
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: The oldest claimable timer is over 30 seconds late
+      - alert: DurableTimerBacklogSampleFailed
+        expr: min(timer_service_backlog_sample_success) == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: A timer replica cannot read backlog from PostgreSQL
+      - alert: DurableTimerBacklogSampleStale
+        expr: time() - min(timer_service_backlog_sample_timestamp_seconds) > 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: A timer replica has not refreshed its backlog sample
+      - alert: DurableTimerDeadLetters
+        expr: sum(increase(timer_service_deliveries_total{result="dead_letter"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Timer delivery moved a timer to dead letters
+      - alert: DurableTimerUnexpectedDeliveryTaskFailure
+        expr: sum(increase(timer_service_delivery_task_failures_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A timer delivery task failed unexpectedly

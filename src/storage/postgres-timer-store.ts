@@ -16,6 +16,8 @@ import { createLogger, type Logger } from '../logger.js'
 import { ServiceError } from '../utils/errors.js'
 import { addMs } from '../utils/time.js'
 import type {
+  BacklogSnapshot,
+  BacklogSnapshotOptions,
   CancelStoreOptions,
   ClaimDueTimersOptions,
   CleanupOptions,
@@ -347,6 +349,29 @@ export class PostgresTimerStore implements TimerStore {
     )
 
     return result.rows.map(toClaimedTimer)
+  }
+
+  async getBacklogSnapshot(options: BacklogSnapshotOptions): Promise<BacklogSnapshot> {
+    // Use the same eligibility predicate as claimDueTimers. All replicas sample
+    // the shared backlog, so dashboards should aggregate these gauges with max.
+    const result = await this.pool.query<{ due_timers: string; oldest_due_at: Date | null }>(
+      `SELECT count(*)::text AS due_timers, min(due_at) AS oldest_due_at
+       FROM timer_slots
+       WHERE due_at <= $1
+         AND deliver_until > $1
+         AND next_attempt_at <= $1
+         AND lane = ANY($2::text[])
+         AND (
+           state = 'scheduled'
+           OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until <= $1)
+         )`,
+      [options.now, options.lanes],
+    )
+
+    return {
+      dueTimers: Number(result.rows[0]!.due_timers),
+      oldestDueAt: result.rows[0]!.oldest_due_at,
+    }
   }
 
   async completeTimer(

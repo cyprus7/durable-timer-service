@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { parseScheduleTimerRequest } from '../src/domain/validation.js'
+import { DAY_MS, HOUR_MS } from '../src/utils/time.js'
 
 const limits = {
   maxScheduleAheadMs: 24 * 60 * 60 * 1000,
@@ -52,5 +53,68 @@ test('parseScheduleTimerRequest rejects too large delivery windows', () => {
       },
       limits,
     ),
+  )
+})
+
+test('SQL time limits cap oversized configuration at the exact boundaries', (t) => {
+  const now = Date.parse('2026-10-11T12:00:00.000Z')
+  t.mock.method(Date, 'now', () => now)
+  const oversized = {
+    ...limits,
+    maxScheduleAheadMs: 2 * DAY_MS,
+    maxDeliveryWindowMs: 2 * HOUR_MS,
+  }
+
+  const request = (dueAtMs: number, deliverUntilMs: number) => ({
+    namespace: 'example',
+    timerKey: 'workflow:8d12:retry',
+    timerId: '019abc',
+    generation: 42,
+    sessionId: 'workflow:8d12',
+    kind: 'job.retry',
+    dueAt: new Date(dueAtMs).toISOString(),
+    deliverUntil: new Date(deliverUntilMs).toISOString(),
+    target: 'example-worker',
+    payload: {},
+  })
+
+  const boundary = parseScheduleTimerRequest(request(now + DAY_MS, now + DAY_MS + HOUR_MS), oversized)
+  assert.equal(boundary.dueAt.getTime(), now + DAY_MS)
+  assert.equal(boundary.deliverUntil.getTime(), now + DAY_MS + HOUR_MS)
+
+  assert.throws(
+    () => parseScheduleTimerRequest(request(now + DAY_MS + 1, now + DAY_MS + 1), oversized),
+    { statusCode: 400, code: 'due_at_too_far' },
+  )
+  assert.throws(
+    () => parseScheduleTimerRequest(request(now, now + HOUR_MS + 1), oversized),
+    { statusCode: 400, code: 'delivery_window_too_large' },
+  )
+})
+
+test('lower configured time limits still apply', (t) => {
+  const now = Date.parse('2026-10-11T12:00:00.000Z')
+  t.mock.method(Date, 'now', () => now)
+  const request = {
+    namespace: 'example',
+    timerKey: 'workflow:8d12:retry',
+    timerId: '019abc',
+    generation: 42,
+    sessionId: 'workflow:8d12',
+    kind: 'job.retry',
+    dueAt: new Date(now + 2_001).toISOString(),
+    deliverUntil: new Date(now + 3_001).toISOString(),
+    target: 'example-worker',
+    payload: {},
+  }
+  assert.throws(
+    () => parseScheduleTimerRequest(request, { ...limits, maxScheduleAheadMs: 2_000 }),
+    { statusCode: 400, code: 'due_at_too_far' },
+  )
+  assert.throws(
+    () => parseScheduleTimerRequest({ ...request, dueAt: new Date(now).toISOString() }, {
+      ...limits, maxDeliveryWindowMs: 3_000,
+    }),
+    { statusCode: 400, code: 'delivery_window_too_large' },
   )
 })

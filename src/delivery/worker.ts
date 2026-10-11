@@ -4,13 +4,17 @@ import type { ClaimedTimer, DeliveryErrorInfo, ReceiptDisposition } from '../dom
 import type { Logger } from '../logger.js'
 import type { TimerMetrics } from '../metrics.js'
 import type { TimerStore } from '../storage/timer-store.js'
+import { toErrorMessage } from '../utils/errors.js'
 import { addMs, computeNextAttemptAt } from '../utils/time.js'
 import type { HttpCallbackClient } from './callback-client.js'
+
+const BACKLOG_SAMPLE_INTERVAL_MS = 10_000
 
 export class TimerWorker {
   private readonly abortController = new AbortController()
   private loopPromise: Promise<void> | null = null
   private cleanupPromise: Promise<void> | null = null
+  private backlogPromise: Promise<void> | null = null
 
   constructor(
     private readonly store: TimerStore,
@@ -23,11 +27,12 @@ export class TimerWorker {
   start(): void {
     this.loopPromise = this.runDeliveryLoop()
     this.cleanupPromise = this.runCleanupLoop()
+    this.backlogPromise = this.runBacklogLoop()
   }
 
   async stop(): Promise<void> {
     this.abortController.abort()
-    await Promise.allSettled([this.loopPromise, this.cleanupPromise].filter(Boolean))
+    await Promise.allSettled([this.loopPromise, this.cleanupPromise, this.backlogPromise].filter(Boolean))
   }
 
   private async runDeliveryLoop(): Promise<void> {
@@ -53,7 +58,22 @@ export class TimerWorker {
           timers.length,
           timers.map((timer) => timer.lane),
         )
-        await Promise.allSettled(timers.map((timer) => this.deliver(timer)))
+        const results = await Promise.allSettled(timers.map((timer) => this.deliver(timer)))
+
+        for (const [index, result] of results.entries()) {
+          if (result.status !== 'rejected') {
+            continue
+          }
+
+          const timer = timers[index]!
+          this.metrics.recordDeliveryTaskFailure()
+          this.logger.error('timer_delivery_task_failed', {
+            timerId: timer.timerId,
+            timerKey: timer.timerKey,
+            generation: timer.generation,
+            error: result.reason instanceof Error ? result.reason : toErrorMessage(result.reason),
+          })
+        }
       } catch (error) {
         this.metrics.recordClaimCycle('error')
         this.logger.error('timer_worker_loop_failed', { error })
@@ -88,8 +108,28 @@ export class TimerWorker {
     }
   }
 
+  private async runBacklogLoop(): Promise<void> {
+    while (!this.abortController.signal.aborted) {
+      try {
+        const now = new Date()
+        const snapshot = await this.store.getBacklogSnapshot({ now, lanes: this.config.lanes })
+        this.metrics.recordBacklogSnapshot({
+          dueTimers: snapshot.dueTimers,
+          oldestDueSeconds: snapshot.oldestDueAt
+            ? Math.max(0, now.getTime() - snapshot.oldestDueAt.getTime()) / 1000
+            : 0,
+        }, now)
+      } catch (error) {
+        this.metrics.recordBacklogSampleFailure()
+        this.logger.error('timer_backlog_sample_failed', { error })
+      }
+      await sleep(BACKLOG_SAMPLE_INTERVAL_MS, this.abortController.signal)
+    }
+  }
+
   private async deliver(timer: ClaimedTimer): Promise<void> {
-    this.metrics.recordDeliveryStarted()
+    const startedAt = new Date()
+    this.metrics.recordDeliveryStarted(timer.dueAt, startedAt)
 
     try {
       const result = await this.callbackClient.deliver(timer)

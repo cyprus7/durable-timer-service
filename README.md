@@ -73,11 +73,18 @@ node --env-file=.env dist/src/main.js
 | `HTTP_CLIENT_TIMEOUT_MS` | `5000` | Callback request timeout. |
 | `MAX_CALLBACK_RESPONSE_BYTES` | `65536` | Maximum callback response bytes read into memory. |
 | `MAX_PAYLOAD_BYTES` | `16384` | Maximum request body and timer payload size. |
-| `MAX_SCHEDULE_AHEAD_MS` | `86400000` | Maximum allowed distance between now and `dueAt`. |
-| `MAX_DELIVERY_WINDOW_MS` | `3600000` | Maximum allowed distance between `dueAt` and `deliverUntil`. |
+| `MAX_SCHEDULE_AHEAD_MS` | `86400000` | Maximum allowed distance between now and `dueAt`, capped at 24 hours by the database schema. |
+| `MAX_DELIVERY_WINDOW_MS` | `3600000` | Maximum allowed distance between `dueAt` and `deliverUntil`, capped at 1 hour by the database schema. |
 | `RETRY_BASE_MS` | `1000` | Initial retry delay. |
 | `RETRY_MAX_MS` | `60000` | Maximum retry delay. |
 | `RETRY_JITTER_RATIO` | `0.2` | Random retry jitter ratio. |
+
+The `timer_slots` constraints in `migrations/001_init.sql` enforce a 24-hour
+scheduling horizon and a 1-hour delivery window. Smaller configured limits
+still apply. Larger values are accepted as configuration but do not raise these
+effective limits; requests outside the schema limits return HTTP 400 with
+`due_at_too_far` or `delivery_window_too_large`. Raising the hard limits
+requires a schema migration and matching validation change.
 
 Example target registry:
 
@@ -147,6 +154,11 @@ Cancellation must match both `timerId` and `generation`.
 - `GET /health/live` reports process liveness.
 - `GET /health/ready` checks database connectivity and the required tables and admission row. An incomplete schema returns 503 with code `schema_not_ready`; startup also fails before listening when a migration is missing.
 - `GET /metrics` exposes Prometheus text metrics.
+- `timer_service_delivery_start_lag_seconds` is a fixed-bucket histogram of the time from `dueAt` to the start of each delivery attempt (including retries). Negative lag is recorded as zero. It has no timer-specific labels.
+- `timer_service_due_backlog_timers` and `timer_service_oldest_due_seconds` sample, every 10 seconds, timers eligible for a new claim in the instance's configured lanes. Active leases, future retries and elapsed delivery windows are excluded. Each replica reports the same database-wide queue for its lanes; use `max`, not `sum`, across replicas. These are exact database counts, so watch query cost at large queue sizes.
+- `timer_service_backlog_sample_success`, `timer_service_backlog_sample_timestamp_seconds` and `timer_service_backlog_sample_failures_total` distinguish a fresh zero backlog from a failed or stale sample. A sample failure does not clear the previous backlog gauges.
+
+Example Prometheus alert rules are in [`docs/prometheus-alert-rules.yaml`](docs/prometheus-alert-rules.yaml). Adjust thresholds to the application's deadline and traffic profile.
 
 Protect health and metrics endpoints at the network perimeter when they are not intended to be public.
 
