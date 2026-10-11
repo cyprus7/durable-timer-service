@@ -595,6 +595,95 @@ test('a callback that keeps requesting retry becomes a dead letter at the delive
   } finally { await pool.end() }
 })
 
+test('cleanup preserves an in-flight callback past deliverUntil while its lease is active', async () => {
+  let callbackStarted!: () => void
+  let releaseCallback!: () => void
+  const started = new Promise<void>((resolve) => { callbackStarted = resolve })
+  const released = new Promise<void>((resolve) => { releaseCallback = resolve })
+  const callback = await startCallbackServer(async () => {
+    callbackStarted()
+    await released
+    return { disposition: 'applied' }
+  })
+  const scheduler = await startHarness(callback.url, { workerEnabled: false })
+  const timerId = 'in-flight-at-deadline'
+  const now = new Date()
+  const deliverUntil = new Date(now.getTime() + 10_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(now.getTime() - 100).toISOString(),
+    deliverUntil: deliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const [claim] = await store.claimDueTimers({
+      now, ownerId: 'in-flight-worker',
+      leaseUntil: new Date(now.getTime() + 20_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.ok(claim)
+    const client = new HttpCallbackClient(
+      new StaticCallbackRegistry(new Map([['example-worker', callback.url]])), 5_000,
+    )
+    const delivery = client.deliver(claim)
+    await Promise.race([
+      started,
+      delivery.then((result) => { assert.fail(`Callback ended before it started: ${JSON.stringify(result)}`) }),
+    ])
+
+    const afterDeadline = new Date(deliverUntil.getTime() + 1)
+    const cleanup = await store.cleanup({
+      now: afterDeadline, limit: 1, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    })
+    assert.equal(cleanup.movedOverdueTimers, 0)
+    assert.equal(await storeReceipt(timerId), null)
+
+    releaseCallback()
+    assert.deepEqual(await delivery, { kind: 'terminal', disposition: 'applied' })
+    assert.equal(await store.completeTimer(claim, 'applied', {
+      now: afterDeadline, receiptRetentionMs: 60_000,
+    }), true)
+    assert.equal(await storeReceipt(timerId), 'applied')
+    const pool = new Pool({ connectionString: databaseUrl })
+    try {
+      const deadLetters = await pool.query('SELECT count(*)::int AS n FROM timer_dead_letters WHERE timer_id = $1', [timerId])
+      assert.equal(deadLetters.rows[0].n, 0)
+    } finally { await pool.end() }
+  } finally {
+    releaseCallback()
+    await store.close()
+  }
+})
+
+test('cleanup dead-letters an overdue timer after its delivery lease expires', async () => {
+  const scheduler = await startHarness('http://unused', { workerEnabled: false })
+  const timerId = 'expired-lease-at-deadline'
+  const now = new Date()
+  const deliverUntil = new Date(now.getTime() + 10_000)
+  await postJson(`${scheduler.baseUrl}/v1/timers`, {
+    ...timerInput(timerId),
+    dueAt: new Date(now.getTime() - 100).toISOString(),
+    deliverUntil: deliverUntil.toISOString(),
+  })
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const [claim] = await store.claimDueTimers({
+      now, ownerId: 'expired-lease-worker',
+      leaseUntil: new Date(deliverUntil.getTime() + 1_000),
+      lanes: ['realtime'], limit: 1,
+    })
+    assert.ok(claim)
+    const cleanup = await store.cleanup({
+      now: new Date(deliverUntil.getTime() + 1_001),
+      limit: 1, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
+    })
+    assert.equal(cleanup.movedOverdueTimers, 1)
+    assert.equal(await storeReceipt(timerId), 'dead_letter')
+  } finally { await store.close() }
+})
+
 test('an already-expired timer is never claimed for delivery and is dead-lettered by cleanup', async () => {
   const scheduler = await startHarness('http://unused', { workerEnabled: false })
   const timerId = 'expired-before-claim'

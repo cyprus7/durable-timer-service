@@ -433,6 +433,8 @@ export class PostgresTimerStore implements TimerStore {
             SELECT namespace, timer_key
             FROM timer_slots
             WHERE deliver_until <= $1
+              -- A callback started before the deadline may still complete under its lease.
+              AND (state <> 'leased' OR lease_until IS NULL OR lease_until <= $1)
             ORDER BY deliver_until ASC
             LIMIT $2
             FOR UPDATE SKIP LOCKED
