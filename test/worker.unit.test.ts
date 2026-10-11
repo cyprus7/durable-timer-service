@@ -124,3 +124,77 @@ test('a callback from a stale lease is not reported as a completed delivery', as
   assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored'])
   assert.doesNotMatch(metrics.render(), /timer_service_deliveries_total/)
 })
+
+test('a rejected delivery task is reported while another timer in the batch completes', async () => {
+  const now = new Date()
+  const timer: ClaimedTimer = {
+    namespace: 'test', timerKey: 'failed', timerId: 'failed-id', generation: 1,
+    sessionId: 'session', kind: 'test', lane: 'realtime', dueAt: now,
+    deliverUntil: new Date(now.getTime() + 60_000), target: 'test', routingKey: null,
+    payload: { secret: 'do-not-log' }, attempt: 0, leaseOwner: 'worker',
+    leaseUntil: new Date(now.getTime() + 1_000), scheduledAt: now, updatedAt: now,
+  }
+  const successfulTimer = { ...timer, timerKey: 'successful', timerId: 'successful-id' }
+  let claimCount = 0
+  let resolveNextClaim: (() => void) | undefined
+  const nextClaim = new Promise<void>((resolve) => { resolveNextClaim = resolve })
+  const completed: string[] = []
+  let failureRecords = 0
+  const store = {
+    claimDueTimers: async () => {
+      claimCount += 1
+      if (claimCount === 1) return [timer, successfulTimer]
+      resolveNextClaim?.()
+      return []
+    },
+    completeTimer: async (claimed: ClaimedTimer) => {
+      completed.push(claimed.timerId)
+      if (claimed.timerId === timer.timerId) throw new Error('database write failed')
+      return true
+    },
+    recordDeliveryFailure: async () => { failureRecords += 1; return true },
+    cleanup: async () => ({ expiredReceipts: 0, expiredDeadLetters: 0, movedOverdueTimers: 0 }),
+  } as unknown as TimerStore
+  const callbackClient = {
+    deliver: async () => ({ kind: 'terminal', disposition: 'applied' }),
+  } as unknown as HttpCallbackClient
+  const errors: Array<{ message: string; fields?: Record<string, unknown> }> = []
+  const infos: string[] = []
+  const logger: Logger = {
+    debug: () => {},
+    info: (message) => { infos.push(message) },
+    warn: () => {},
+    error: (message, fields) => { errors.push({ message, ...(fields ? { fields } : {}) }) },
+  }
+  const config = {
+    instanceId: 'worker', lanes: ['realtime'], claimBatchSize: 2, leaseMs: 1_000,
+    pollIntervalMs: 100, cleanupIntervalMs: 60_000, receiptRetentionMs: 60_000,
+  } as unknown as AppConfig
+  const metrics = new TimerMetrics({ instanceId: config.instanceId })
+  const worker = new TimerWorker(store, callbackClient, config, logger, metrics)
+  const timeout = setTimeout(() => resolveNextClaim?.(), 2_000)
+
+  worker.start()
+  try {
+    await nextClaim
+  } finally {
+    clearTimeout(timeout)
+    await worker.stop()
+  }
+
+  assert.ok(claimCount >= 2, 'the worker continued to its next polling cycle')
+  assert.deepEqual(completed.sort(), ['failed-id', 'successful-id'])
+  assert.equal(failureRecords, 0, 'the failed lease remains available for normal recovery')
+  assert.deepEqual(infos, ['timer_delivery_completed'])
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0]?.message, 'timer_delivery_task_failed')
+  assert.deepEqual(Object.keys(errors[0]?.fields ?? {}), ['timerId', 'timerKey', 'generation', 'error'])
+  assert.equal(errors[0]?.fields?.timerId, 'failed-id')
+  assert.equal(errors[0]?.fields?.timerKey, 'failed')
+  assert.equal(errors[0]?.fields?.generation, 1)
+  assert.match(String(errors[0]?.fields?.error), /database write failed/)
+  assert.doesNotMatch(JSON.stringify(errors), /do-not-log/)
+  assert.match(metrics.render(), /timer_service_delivery_task_failures_total 1/)
+  assert.match(metrics.render(), /timer_service_deliveries_total\{disposition="applied",result="terminal"\} 1/)
+  assert.match(metrics.render(), /timer_service_inflight_deliveries 0/)
+})

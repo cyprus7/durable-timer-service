@@ -59,6 +59,10 @@ export class TimerMetrics {
     this.registry.incGauge('timer_service_inflight_deliveries', 'Current in-flight timer deliveries.', {}, -1)
   }
 
+  recordDeliveryTaskFailure(): void {
+    this.registry.inc('timer_service_delivery_task_failures_total', 'Timer delivery tasks rejected by an unexpected error.', {})
+  }
+
   recordCleanup(input: {
     readonly movedOverdueTimers: number
     readonly expiredReceipts: number

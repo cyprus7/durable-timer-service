@@ -4,6 +4,7 @@ import type { ClaimedTimer, DeliveryErrorInfo, ReceiptDisposition } from '../dom
 import type { Logger } from '../logger.js'
 import type { TimerMetrics } from '../metrics.js'
 import type { TimerStore } from '../storage/timer-store.js'
+import { toErrorMessage } from '../utils/errors.js'
 import { addMs, computeNextAttemptAt } from '../utils/time.js'
 import type { HttpCallbackClient } from './callback-client.js'
 
@@ -53,7 +54,22 @@ export class TimerWorker {
           timers.length,
           timers.map((timer) => timer.lane),
         )
-        await Promise.allSettled(timers.map((timer) => this.deliver(timer)))
+        const results = await Promise.allSettled(timers.map((timer) => this.deliver(timer)))
+
+        for (const [index, result] of results.entries()) {
+          if (result.status !== 'rejected') {
+            continue
+          }
+
+          const timer = timers[index]!
+          this.metrics.recordDeliveryTaskFailure()
+          this.logger.error('timer_delivery_task_failed', {
+            timerId: timer.timerId,
+            timerKey: timer.timerKey,
+            generation: timer.generation,
+            error: result.reason instanceof Error ? result.reason : toErrorMessage(result.reason),
+          })
+        }
       } catch (error) {
         this.metrics.recordClaimCycle('error')
         this.logger.error('timer_worker_loop_failed', { error })
