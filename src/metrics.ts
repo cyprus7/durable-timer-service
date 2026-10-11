@@ -33,16 +33,26 @@ export class TimerMetrics {
     }
   }
 
-  recordDeliveryStarted(dueAt: Date, startedAt = new Date()): void {
+  recordDeliveryStarted(dueAt: Date, startedAt = new Date(), attempt?: number): void {
     this.registry.inc('timer_service_delivery_attempts_total', 'Timer delivery attempts.', {})
     this.registry.incGauge('timer_service_inflight_deliveries', 'Current in-flight timer deliveries.', {}, 1)
+    const lagSeconds = Math.max(0, startedAt.getTime() - dueAt.getTime()) / 1000
     this.registry.observe(
       'timer_service_delivery_start_lag_seconds',
       'Seconds between timer due time and the start of a delivery attempt.',
       {},
-      Math.max(0, startedAt.getTime() - dueAt.getTime()) / 1000,
+      lagSeconds,
       DELIVERY_START_LAG_BUCKETS_SECONDS,
     )
+    if (attempt === 0) {
+      this.registry.observe(
+        'timer_service_delivery_start_lag_attempt_zero_seconds',
+        'Seconds between timer due time and a delivery start with no recorded failures.',
+        {},
+        lagSeconds,
+        DELIVERY_START_LAG_BUCKETS_SECONDS,
+      )
+    }
   }
 
   recordDeliveryTerminal(disposition: string): void {

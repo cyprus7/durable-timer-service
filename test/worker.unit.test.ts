@@ -120,11 +120,13 @@ test('a callback from a stale lease is not reported as a completed delivery', as
   }
 
   await (worker as unknown as { deliver(timer: ClaimedTimer): Promise<void> }).deliver(timer)
+  await (worker as unknown as { deliver(timer: ClaimedTimer): Promise<void> }).deliver({ ...timer, attempt: 1 })
 
   assert.deepEqual(infos, [])
-  assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored'])
+  assert.deepEqual(warnings, ['timer_delivery_stale_claim_ignored', 'timer_delivery_stale_claim_ignored'])
   assert.doesNotMatch(metrics.render(), /timer_service_deliveries_total/)
-  assert.match(metrics.render(), /timer_service_delivery_start_lag_seconds_count 1/)
+  assert.match(metrics.render(), /timer_service_delivery_start_lag_seconds_count 2/)
+  assert.match(metrics.render(), /timer_service_delivery_start_lag_attempt_zero_seconds_count 1/)
 })
 
 test('a rejected delivery task is reported while another timer in the batch completes', async () => {

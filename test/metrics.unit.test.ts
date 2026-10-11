@@ -29,6 +29,25 @@ test('delivery start lag histogram uses cumulative fixed buckets and clamps earl
   assert.match(text, /timer_service_delivery_attempts_total 6/)
 })
 
+test('attempt-zero lag excludes recorded retries while retaining all-attempt lag', () => {
+  const metrics = new TimerMetrics({ instanceId: 'attempt-zero-test' })
+  const dueAt = new Date('2026-01-01T00:00:00.000Z')
+
+  metrics.recordDeliveryStarted(dueAt, new Date(dueAt.getTime() + 50), 0)
+  metrics.recordDeliveryStarted(dueAt, new Date(dueAt.getTime() + 5_000), 1)
+  metrics.recordDeliveryStarted(dueAt, new Date(dueAt.getTime() + 100), 0)
+
+  const text = metrics.render()
+  assert.match(text, /timer_service_delivery_start_lag_seconds_count 3/)
+  assert.match(text, /timer_service_delivery_start_lag_attempt_zero_seconds_count 2/)
+  assert.match(text, /timer_service_delivery_start_lag_attempt_zero_seconds_bucket\{le="0\.1"\} 2/)
+  assert.match(text, /timer_service_delivery_attempts_total 3/)
+  const allAttemptsSum = Number(text.match(/timer_service_delivery_start_lag_seconds_sum ([^\n]+)/)?.[1])
+  const attemptZeroSum = Number(text.match(/timer_service_delivery_start_lag_attempt_zero_seconds_sum ([^\n]+)/)?.[1])
+  assert.ok(Math.abs(allAttemptsSum - 5.15) < 1e-9)
+  assert.ok(Math.abs(attemptZeroSum - 0.15) < 1e-9)
+})
+
 test('backlog gauges expose a fresh shared snapshot and failed samples', () => {
   const metrics = new TimerMetrics({ instanceId: 'backlog-test' })
   const sampledAt = new Date('2026-01-01T00:00:00.000Z')

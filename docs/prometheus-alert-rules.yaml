@@ -30,12 +30,15 @@ groups:
         annotations:
           summary: A timer replica has not refreshed its backlog sample
       - alert: DurableTimerDeadLetters
-        expr: sum(increase(timer_service_deliveries_total{result="dead_letter"}[5m])) > 0
+        expr: >-
+          (sum(increase(timer_service_deliveries_total{result="dead_letter"}[5m])) > 0)
+          or
+          (sum(increase(timer_service_cleanup_items_total{kind="moved_overdue_timers"}[5m])) > 0)
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: Timer delivery moved a timer to dead letters
+          summary: A timer moved to dead letters
       - alert: DurableTimerUnexpectedDeliveryTaskFailure
         expr: sum(increase(timer_service_delivery_task_failures_total[5m])) > 0
         for: 0m

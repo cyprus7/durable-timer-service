@@ -32,6 +32,11 @@ jobs:
       - name: Build and test
         run: npm test
 
+      - name: Validate Prometheus alerts
+        run: |
+          docker run --rm --volume "$PWD:/workspace:ro" --workdir /workspace --entrypoint promtool prom/prometheus:v3.14.0 check rules docs/prometheus-alert-rules.yaml
+          docker run --rm --volume "$PWD:/workspace:ro" --workdir /workspace --entrypoint promtool prom/prometheus:v3.14.0 test rules test/prometheus-alert-rules.test.yaml
+
       - name: Start integration database
         run: npm run e2e:up
 
