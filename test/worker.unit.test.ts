@@ -204,6 +204,7 @@ test('a rejected delivery task is reported while another timer in the batch comp
 
 test('backlog sampling recovers from transient failures and records metrics', async () => {
   let resolveReady: (() => void) | undefined
+  let recoveryTimeout: ReturnType<typeof setTimeout> | undefined
   const ready = new Promise<void>((resolve) => {
     resolveReady = resolve
   })
@@ -269,7 +270,7 @@ test('backlog sampling recovers from transient failures and records metrics', as
     await Promise.race([
       ready,
       new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('backlog sampling did not recover')), 25_000)
+        recoveryTimeout = setTimeout(() => reject(new Error('backlog sampling did not recover')), 25_000)
       }),
     ])
 
@@ -283,6 +284,9 @@ test('backlog sampling recovers from transient failures and records metrics', as
     assert.match(metricsOutput, /timer_service_backlog_sample_success 1/)
     assert.match(metricsOutput, /timer_service_due_backlog_timers 5/)
   } finally {
+    if (recoveryTimeout !== undefined) {
+      clearTimeout(recoveryTimeout)
+    }
     await worker.stop()
   }
 })
