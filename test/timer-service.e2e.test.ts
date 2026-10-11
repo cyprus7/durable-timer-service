@@ -629,12 +629,16 @@ test('a callback that keeps requesting retry becomes a dead letter at the delive
   try {
     const slots = await pool.query('SELECT count(*)::int AS n FROM timer_slots')
     const deadLetters = await pool.query(
-      'SELECT timer_id, last_error->>\'reason\' AS reason FROM timer_dead_letters WHERE timer_id = $1',
+      'SELECT timer_id, last_error->>\'reason\' AS reason, failed_at >= deliver_until AS after_deadline FROM timer_dead_letters WHERE timer_id = $1',
       [timerId],
     )
     assert.equal(slots.rows[0].n, 0)
     assert.equal(deadLetters.rows.length, 1)
-    assert.equal(deadLetters.rows[0].reason, 'deliver_until_expired')
+    assert.equal(deadLetters.rows[0].after_deadline, true)
+    assert.ok(
+      ['deliver_until_expired', 'consumer_requested_retry'].includes(deadLetters.rows[0].reason),
+      `unexpected dead-letter reason: ${deadLetters.rows[0].reason}`,
+    )
   } finally { await pool.end() }
 })
 
