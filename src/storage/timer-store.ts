@@ -40,6 +40,13 @@ export interface BacklogSnapshotOptions {
 export interface BacklogSnapshot {
   readonly dueTimers: number
   readonly oldestDueAt: Date | null
+  readonly byLane?: readonly BacklogLaneSnapshot[]
+}
+
+export interface BacklogLaneSnapshot {
+  readonly lane: string
+  readonly dueTimers: number
+  readonly oldestDueAt: Date | null
 }
 
 export interface CompleteTimerOptions {

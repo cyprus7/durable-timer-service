@@ -74,9 +74,21 @@ export class TimerMetrics {
     this.registry.inc('timer_service_delivery_task_failures_total', 'Timer delivery tasks rejected by an unexpected error.', {})
   }
 
-  recordBacklogSnapshot(input: { readonly dueTimers: number; readonly oldestDueSeconds: number }, sampledAt: Date): void {
+  recordBacklogSnapshot(input: {
+    readonly dueTimers: number
+    readonly oldestDueSeconds: number
+    readonly byLane?: readonly {
+      readonly lane: string
+      readonly dueTimers: number
+      readonly oldestDueSeconds: number
+    }[]
+  }, sampledAt: Date): void {
     this.registry.set('timer_service_due_backlog_timers', 'Due timers eligible for a new claim in this instance\'s lanes.', {}, input.dueTimers)
     this.registry.set('timer_service_oldest_due_seconds', 'Age in seconds of the oldest due timer eligible for a new claim.', {}, input.oldestDueSeconds)
+    for (const lane of input.byLane ?? []) {
+      this.registry.set('timer_service_due_backlog_by_lane_timers', 'Due timers eligible for a new claim in this lane.', { lane: lane.lane }, lane.dueTimers)
+      this.registry.set('timer_service_oldest_due_by_lane_seconds', 'Age in seconds of the oldest due timer eligible for a new claim in this lane.', { lane: lane.lane }, lane.oldestDueSeconds)
+    }
     this.registry.set('timer_service_backlog_sample_success', 'Whether the most recent backlog sample succeeded.', {}, 1)
     this.registry.set('timer_service_backlog_sample_timestamp_seconds', 'Unix time of the most recent successful backlog sample.', {}, sampledAt.getTime() / 1000)
   }

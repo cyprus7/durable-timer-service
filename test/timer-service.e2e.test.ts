@@ -146,6 +146,45 @@ test('backlog snapshot excludes active leases, future work and expired delivery 
   } finally { await store.close() }
 })
 
+test('backlog snapshots preserve per-lane counts for disjoint and overlapping workers', async () => {
+  const scheduler = await startHarness('http://unused', { workerEnabled: false })
+  const start = Date.now()
+  const oldestDue = new Date(start - 3_000)
+  const realtimeDue = new Date(start - 2_000)
+  const deliverUntil = new Date(start + 60_000).toISOString()
+  for (const [id, lane, dueAt] of [
+    ['realtime-first', 'realtime', realtimeDue],
+    ['realtime-second', 'realtime', new Date(start - 1_000)],
+    ['background-first', 'background', oldestDue],
+  ] as const) {
+    await postJson(`${scheduler.baseUrl}/v1/timers`, {
+      ...timerInput(id), lane, dueAt: dueAt.toISOString(), deliverUntil,
+    })
+  }
+
+  const store = new PostgresTimerStore(databaseUrl)
+  try {
+    const now = new Date(start + 1_000)
+    const realtime = await store.getBacklogSnapshot({ now, lanes: ['realtime'] })
+    const background = await store.getBacklogSnapshot({ now, lanes: ['background'] })
+    const overlapping = await store.getBacklogSnapshot({ now, lanes: ['realtime', 'background', 'realtime', 'empty'] })
+
+    assert.equal(realtime.dueTimers, 2)
+    assert.equal(realtime.oldestDueAt?.getTime(), realtimeDue.getTime())
+    assert.deepEqual(realtime.byLane?.map(({ lane, dueTimers }) => [lane, dueTimers]), [['realtime', 2]])
+    assert.equal(background.dueTimers, 1)
+    assert.equal(background.oldestDueAt?.getTime(), oldestDue.getTime())
+    assert.deepEqual(background.byLane?.map(({ lane, dueTimers }) => [lane, dueTimers]), [['background', 1]])
+    assert.equal(overlapping.dueTimers, 3)
+    assert.equal(overlapping.oldestDueAt?.getTime(), oldestDue.getTime())
+    assert.deepEqual(overlapping.byLane?.map(({ lane, dueTimers, oldestDueAt }) => [lane, dueTimers, oldestDueAt?.getTime() ?? null]), [
+      ['realtime', 2, realtimeDue.getTime()],
+      ['background', 1, oldestDue.getTime()],
+      ['empty', 0, null],
+    ])
+  } finally { await store.close() }
+})
+
 test('does not let a stale cancel delete a newer active timer', async () => {
   const callback = await startCallbackServer(async () => ({ disposition: 'applied' }))
   const harness = await startHarness(callback.url, { workerEnabled: false })

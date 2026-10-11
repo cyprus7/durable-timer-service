@@ -118,6 +118,13 @@ export class TimerWorker {
           oldestDueSeconds: snapshot.oldestDueAt
             ? Math.max(0, now.getTime() - snapshot.oldestDueAt.getTime()) / 1000
             : 0,
+          byLane: (snapshot.byLane ?? []).map((lane) => ({
+            lane: lane.lane,
+            dueTimers: lane.dueTimers,
+            oldestDueSeconds: lane.oldestDueAt
+              ? Math.max(0, now.getTime() - lane.oldestDueAt.getTime()) / 1000
+              : 0,
+          })),
         }, now)
       } catch (error) {
         this.metrics.recordBacklogSampleFailure()

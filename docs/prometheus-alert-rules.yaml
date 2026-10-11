@@ -2,14 +2,14 @@ groups:
   - name: durable-timer-service
     rules:
       - alert: DurableTimerDueBacklogHigh
-        expr: max(timer_service_due_backlog_timers) > 1000
+        expr: sum(max by (lane) (timer_service_due_backlog_by_lane_timers)) > 1000
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: More than 1000 timers are eligible for delivery
       - alert: DurableTimerOldestDueHigh
-        expr: max(timer_service_oldest_due_seconds) > 30
+        expr: max(max by (lane) (timer_service_oldest_due_by_lane_seconds)) > 30
         for: 2m
         labels:
           severity: warning

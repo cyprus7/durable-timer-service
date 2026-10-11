@@ -227,7 +227,11 @@ test('backlog sampling recovers from transient failures and records metrics', as
       }
       // Recovery succeeds on next attempts
       resolveReady?.()
-      return { dueTimers: 5, oldestDueAt: new Date(Date.now() - 1000) }
+      return {
+        dueTimers: 5,
+        oldestDueAt: new Date(Date.now() - 1000),
+        byLane: [{ lane: 'realtime', dueTimers: 5, oldestDueAt: new Date(Date.now() - 1000) }],
+      }
     },
   } as unknown as TimerStore
   const callbackClient = {} as HttpCallbackClient
@@ -283,6 +287,7 @@ test('backlog sampling recovers from transient failures and records metrics', as
     assert.match(metricsOutput, /timer_service_backlog_sample_failures_total 1/)
     assert.match(metricsOutput, /timer_service_backlog_sample_success 1/)
     assert.match(metricsOutput, /timer_service_due_backlog_timers 5/)
+    assert.match(metricsOutput, /timer_service_due_backlog_by_lane_timers\{lane="realtime"\} 5/)
   } finally {
     if (recoveryTimeout !== undefined) {
       clearTimeout(recoveryTimeout)
