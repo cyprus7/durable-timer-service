@@ -29,6 +29,7 @@ test('idle polling does not accumulate abort listeners', async () => {
       expiredDeadLetters: 0,
       movedOverdueTimers: 0,
     }),
+    getBacklogSnapshot: async () => ({ dueTimers: 0, oldestDueAt: null }),
   } as unknown as TimerStore
   const callbackClient = {} as HttpCallbackClient
   const logger: Logger = {
@@ -85,7 +86,7 @@ test('idle polling does not accumulate abort listeners', async () => {
     ])
 
     assert.ok(claimCount >= 25)
-    assert.ok(getEventListeners(signal, 'abort').length <= 2)
+    assert.ok(getEventListeners(signal, 'abort').length <= 3)
   } finally {
     await worker.stop()
   }
@@ -155,6 +156,7 @@ test('a rejected delivery task is reported while another timer in the batch comp
     },
     recordDeliveryFailure: async () => { failureRecords += 1; return true },
     cleanup: async () => ({ expiredReceipts: 0, expiredDeadLetters: 0, movedOverdueTimers: 0 }),
+    getBacklogSnapshot: async () => ({ dueTimers: 0, oldestDueAt: null }),
   } as unknown as TimerStore
   const callbackClient = {
     deliver: async () => ({ kind: 'terminal', disposition: 'applied' }),

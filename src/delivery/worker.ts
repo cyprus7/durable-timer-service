@@ -8,10 +8,13 @@ import { toErrorMessage } from '../utils/errors.js'
 import { addMs, computeNextAttemptAt } from '../utils/time.js'
 import type { HttpCallbackClient } from './callback-client.js'
 
+const BACKLOG_SAMPLE_INTERVAL_MS = 10_000
+
 export class TimerWorker {
   private readonly abortController = new AbortController()
   private loopPromise: Promise<void> | null = null
   private cleanupPromise: Promise<void> | null = null
+  private backlogPromise: Promise<void> | null = null
 
   constructor(
     private readonly store: TimerStore,
@@ -24,11 +27,12 @@ export class TimerWorker {
   start(): void {
     this.loopPromise = this.runDeliveryLoop()
     this.cleanupPromise = this.runCleanupLoop()
+    this.backlogPromise = this.runBacklogLoop()
   }
 
   async stop(): Promise<void> {
     this.abortController.abort()
-    await Promise.allSettled([this.loopPromise, this.cleanupPromise].filter(Boolean))
+    await Promise.allSettled([this.loopPromise, this.cleanupPromise, this.backlogPromise].filter(Boolean))
   }
 
   private async runDeliveryLoop(): Promise<void> {
@@ -101,6 +105,25 @@ export class TimerWorker {
       } catch (error) {
         this.logger.error('timer_cleanup_failed', { error })
       }
+    }
+  }
+
+  private async runBacklogLoop(): Promise<void> {
+    while (!this.abortController.signal.aborted) {
+      try {
+        const now = new Date()
+        const snapshot = await this.store.getBacklogSnapshot({ now, lanes: this.config.lanes })
+        this.metrics.recordBacklogSnapshot({
+          dueTimers: snapshot.dueTimers,
+          oldestDueSeconds: snapshot.oldestDueAt
+            ? Math.max(0, now.getTime() - snapshot.oldestDueAt.getTime()) / 1000
+            : 0,
+        }, now)
+      } catch (error) {
+        this.metrics.recordBacklogSampleFailure()
+        this.logger.error('timer_backlog_sample_failed', { error })
+      }
+      await sleep(BACKLOG_SAMPLE_INTERVAL_MS, this.abortController.signal)
     }
   }
 

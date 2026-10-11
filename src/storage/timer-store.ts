@@ -32,6 +32,16 @@ export interface ClaimDueTimersOptions {
   readonly limit: number
 }
 
+export interface BacklogSnapshotOptions {
+  readonly now: Date
+  readonly lanes: readonly string[]
+}
+
+export interface BacklogSnapshot {
+  readonly dueTimers: number
+  readonly oldestDueAt: Date | null
+}
+
 export interface CompleteTimerOptions {
   readonly now: Date
   readonly receiptRetentionMs: number
@@ -67,6 +77,7 @@ export interface TimerStore {
   cancelTimer(command: CancelTimerCommand, options: CancelStoreOptions): Promise<CancelTimerResult>
   cancelSession(command: CancelSessionCommand, options: CancelStoreOptions): Promise<CancelSessionResult>
   claimDueTimers(options: ClaimDueTimersOptions): Promise<readonly ClaimedTimer[]>
+  getBacklogSnapshot(options: BacklogSnapshotOptions): Promise<BacklogSnapshot>
   completeTimer(timer: ClaimedTimer, disposition: ReceiptDisposition, options: CompleteTimerOptions): Promise<boolean>
   recordDeliveryFailure(timer: ClaimedTimer, options: RecordFailureOptions): Promise<boolean>
   cleanup(options: CleanupOptions): Promise<CleanupResult>

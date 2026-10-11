@@ -155,6 +155,10 @@ Cancellation must match both `timerId` and `generation`.
 - `GET /health/ready` checks database connectivity and the required tables and admission row. An incomplete schema returns 503 with code `schema_not_ready`; startup also fails before listening when a migration is missing.
 - `GET /metrics` exposes Prometheus text metrics.
 - `timer_service_delivery_start_lag_seconds` is a fixed-bucket histogram of the time from `dueAt` to the start of each delivery attempt (including retries). Negative lag is recorded as zero. It has no timer-specific labels.
+- `timer_service_due_backlog_timers` and `timer_service_oldest_due_seconds` sample, every 10 seconds, timers eligible for a new claim in the instance's configured lanes. Active leases, future retries and elapsed delivery windows are excluded. Each replica reports the same database-wide queue for its lanes; use `max`, not `sum`, across replicas. These are exact database counts, so watch query cost at large queue sizes.
+- `timer_service_backlog_sample_success`, `timer_service_backlog_sample_timestamp_seconds` and `timer_service_backlog_sample_failures_total` distinguish a fresh zero backlog from a failed or stale sample. A sample failure does not clear the previous backlog gauges.
+
+Example Prometheus alert rules are in [`docs/prometheus-alert-rules.yaml`](docs/prometheus-alert-rules.yaml). Adjust thresholds to the application's deadline and traffic profile.
 
 Protect health and metrics endpoints at the network perimeter when they are not intended to be public.
 

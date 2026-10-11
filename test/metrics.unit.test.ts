@@ -28,3 +28,20 @@ test('delivery start lag histogram uses cumulative fixed buckets and clamps earl
   assert.doesNotMatch(text, /timer_service_delivery_start_lag_seconds_(?:bucket|sum|count)\{[^}]*timer_id/)
   assert.match(text, /timer_service_delivery_attempts_total 6/)
 })
+
+test('backlog gauges expose a fresh shared snapshot and failed samples', () => {
+  const metrics = new TimerMetrics({ instanceId: 'backlog-test' })
+  const sampledAt = new Date('2026-01-01T00:00:00.000Z')
+  metrics.recordBacklogSnapshot({ dueTimers: 3, oldestDueSeconds: 12.5 }, sampledAt)
+  let output = metrics.render()
+  assert.match(output, /timer_service_due_backlog_timers 3/)
+  assert.match(output, /timer_service_oldest_due_seconds 12\.5/)
+  assert.match(output, /timer_service_backlog_sample_success 1/)
+  assert.match(output, /timer_service_backlog_sample_timestamp_seconds 1767225600/)
+
+  metrics.recordBacklogSampleFailure()
+  output = metrics.render()
+  assert.match(output, /timer_service_backlog_sample_success 0/)
+  assert.match(output, /timer_service_backlog_sample_failures_total 1/)
+  assert.match(output, /timer_service_backlog_sample_timestamp_seconds 1767225600/)
+})
