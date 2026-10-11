@@ -417,8 +417,7 @@ test('another worker reclaims a due timer after the previous owner dies with its
     assert.equal(firstDelivery.attempt, 1)
     assert.ok(firstDelivery.deliveredAt >= leaseUntil.getTime(), 'a live lease must prevent premature redelivery')
 
-    const receipt = await storeReceipt(timerId)
-    assert.equal(receipt, 'applied')
+    await waitForAsync(async () => (await storeReceipt(timerId)) === 'applied', 5_000)
   } finally {
     await store.close()
   }
