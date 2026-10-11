@@ -1,4 +1,5 @@
 import { ServiceError } from '../utils/errors.js'
+import { DAY_MS, HOUR_MS } from '../utils/time.js'
 import type { CancelSessionCommand, CancelTimerCommand, JsonValue, ScheduleTimerCommand } from './types.js'
 
 const SAFE_TEXT = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,191}$/
@@ -27,7 +28,9 @@ export function parseScheduleTimerRequest(raw: unknown, limits: ValidationLimits
   const payload = readPayload(body.payload, limits.maxPayloadBytes)
   const now = Date.now()
 
-  if (dueAt.getTime() > now + limits.maxScheduleAheadMs) {
+  // The timer_slots checks in 001_init.sql are fixed at 24 hours and 1 hour.
+  // Keep larger operator settings valid, but never admit a request SQL rejects.
+  if (dueAt.getTime() > now + Math.min(limits.maxScheduleAheadMs, DAY_MS)) {
     throw new ServiceError(400, 'due_at_too_far', 'dueAt is beyond the allowed scheduling window')
   }
 
@@ -35,7 +38,7 @@ export function parseScheduleTimerRequest(raw: unknown, limits: ValidationLimits
     throw new ServiceError(400, 'delivery_before_due', 'deliverUntil must be greater than or equal to dueAt')
   }
 
-  if (deliverUntil.getTime() > dueAt.getTime() + limits.maxDeliveryWindowMs) {
+  if (deliverUntil.getTime() > dueAt.getTime() + Math.min(limits.maxDeliveryWindowMs, HOUR_MS)) {
     throw new ServiceError(400, 'delivery_window_too_large', 'deliverUntil is beyond the allowed delivery window')
   }
 

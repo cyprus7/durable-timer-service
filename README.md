@@ -73,11 +73,18 @@ node --env-file=.env dist/src/main.js
 | `HTTP_CLIENT_TIMEOUT_MS` | `5000` | Callback request timeout. |
 | `MAX_CALLBACK_RESPONSE_BYTES` | `65536` | Maximum callback response bytes read into memory. |
 | `MAX_PAYLOAD_BYTES` | `16384` | Maximum request body and timer payload size. |
-| `MAX_SCHEDULE_AHEAD_MS` | `86400000` | Maximum allowed distance between now and `dueAt`. |
-| `MAX_DELIVERY_WINDOW_MS` | `3600000` | Maximum allowed distance between `dueAt` and `deliverUntil`. |
+| `MAX_SCHEDULE_AHEAD_MS` | `86400000` | Maximum allowed distance between now and `dueAt`, capped at 24 hours by the database schema. |
+| `MAX_DELIVERY_WINDOW_MS` | `3600000` | Maximum allowed distance between `dueAt` and `deliverUntil`, capped at 1 hour by the database schema. |
 | `RETRY_BASE_MS` | `1000` | Initial retry delay. |
 | `RETRY_MAX_MS` | `60000` | Maximum retry delay. |
 | `RETRY_JITTER_RATIO` | `0.2` | Random retry jitter ratio. |
+
+The `timer_slots` constraints in `migrations/001_init.sql` enforce a 24-hour
+scheduling horizon and a 1-hour delivery window. Smaller configured limits
+still apply. Larger values are accepted as configuration but do not raise these
+effective limits; requests outside the schema limits return HTTP 400 with
+`due_at_too_far` or `delivery_window_too_large`. Raising the hard limits
+requires a schema migration and matching validation change.
 
 Example target registry:
 
