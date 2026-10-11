@@ -846,6 +846,9 @@ test('cleanup batch preserves an active lease while dead-lettering expired and u
 })
 
 test('cleanup dead-letters an overdue timer after its delivery lease expires', async () => {
+  const metrics = new TimerMetrics({ instanceId: 'cleanup-dead-letter-timestamp-e2e' })
+  assert.match(metrics.render(), /timer_service_last_dead_letter_timestamp_seconds 0/)
+
   const scheduler = await startHarness('http://unused', { workerEnabled: false })
   const timerId = 'expired-lease-at-deadline'
   const now = new Date()
@@ -869,6 +872,10 @@ test('cleanup dead-letters an overdue timer after its delivery lease expires', a
       limit: 1, receiptRetentionMs: 60_000, deadLetterRetentionMs: 60_000,
     })
     assert.equal(cleanup.movedOverdueTimers, 1)
+    metrics.recordCleanup(cleanup)
+    const output = metrics.render()
+    const timestamp = Number(output.match(/^timer_service_last_dead_letter_timestamp_seconds ([^\n]+)/m)?.[1])
+    assert.ok(timestamp > 0)
     assert.equal(await storeReceipt(timerId), 'dead_letter')
   } finally { await store.close() }
 })
