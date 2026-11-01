@@ -20,10 +20,10 @@
     "test:e2e": "npm run build && node --test \"dist/test/**/*.e2e.test.js\""
   },
   "dependencies": {
-    "pg": "^8.23.0"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
-    "@types/node": "^22.20.4",
+    "@types/node": "^22.20.5",
     "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
